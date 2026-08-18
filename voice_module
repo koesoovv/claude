@@ -1,0 +1,1718 @@
+#!/usr/bin/env python3
+"""
+voice_module.py  ─ 음성인식 모듈
+=================================
+silero-VAD + Google STT + 상태머신
+
+담당:
+  - 마이크 입력 / VAD / STT
+  - 상태머신 (SLEEP → 위치 → 급수)
+  - TTS 출력
+  - ESP32 컵 위치 HTTP 통신
+  - 초음파 도착 감지
+  - 정수기 위치 안내 시 0001.mp3 반복 재생 (도착 시 즉시 정지)
+  - 목표 수위 설정 시 smart_water_core.TARGET_FILL_PCT + GUI 반영
+"""
+
+import re
+import time
+import os
+import signal
+import asyncio
+import subprocess
+import shutil
+import collections
+import threading
+import difflib
+
+import sounddevice as sd
+import numpy as np
+import torch
+import edge_tts
+import speech_recognition as sr
+import noisereduce as nr
+import requests
+
+# ════════════════════════════════════════════════════════════════════
+#  설정
+# ════════════════════════════════════════════════════════════════════
+
+VOICE_MIC_DEVICE  = None
+VOICE_SAMPLE_RATE = 16000
+VOICE_CHANNELS    = 1
+VAD_CHUNK_MS      = 32
+VAD_CHUNK_SIZE    = int(VOICE_SAMPLE_RATE * VAD_CHUNK_MS / 1000)
+
+VAD_THRESHOLD  = 0.60
+PRE_ROLL_MS    = 500
+SPEECH_PAD_MS  = 1000
+MIN_SPEECH_MS  = 300
+MAX_WAKE_SEC   = 3.0
+MAX_CMD_SEC    = 10.0
+
+MIN_RMS_FOR_STT = 0.003
+NOISE_REDUCE    = True
+TARGET_RMS      = 0.06
+MAX_GAIN        = 8.0
+NOISE_PROP_DECREASE = 0.25    # noisereduce 강도. 0.35보다 말소리 왜곡을 줄임
+VOICE_READ_FAIL_LIMIT = 3     # 마이크 read 연속 실패 시 voice_loop 재시작 유도
+
+COMMAND_TIMEOUT    = 20.0   # 호출어 인식 후 다음 명령 대기 시간
+LOCATION_TIMEOUT   = COMMAND_TIMEOUT  # 기존 코드 호환용
+CUP_FOUND_TIMEOUT  = 35.0
+CUP_POLL_INTERVAL  = 0.5
+ARRIVAL_TIMEOUT    = 40.0
+LEVEL_TIMEOUT      = 20.0
+READY_TIMEOUT      = 20.0
+POUR_LISTEN_SEC    = 2.0
+
+ULTRASONIC_TRIG_GPIO = 20
+ULTRASONIC_ECHO_GPIO = 21
+ARRIVED_DISTANCE_CM  = 30.0
+ARRIVED_CONFIRM_CNT  = 2
+ULTRASONIC_TIMEOUT   = 0.02
+
+CUP_LOCATOR_URL = 'http://10.201.94.20'
+
+USE_TTS      = True
+TTS_VOICE    = 'ko-KR-SunHiNeural'
+TTS_RATE     = '+10%'
+TTS_VOLUME   = '+10%'
+TTS_PITCH    = '+0Hz'
+TTS_FILE     = '/tmp/tts_output.mp3'
+TTS_COOLDOWN = 1.0
+
+DISPENSER_SOUND_PATH = '/home/kimcapybara/venv/HI/0001.mp3'
+
+DEBUG = True
+
+# ── 사용자 GUI 음성 대기 상태 표시 ───────────────────────────────────
+VOICE_READY_TEXT = '말씀해 주세요'          # 실제로 마이크 입력을 받을 준비가 되었을 때 GUI 표시
+VOICE_BUSY_TEXT  = '안내 중... 잠시 기다려주세요'  # TTS 재생 중 GUI 표시
+VOICE_PROCESS_TEXT = '인식 중...'           # STT 처리 중 GUI 표시
+
+# ── 정수기 안내 음원 제어 ─────────────────────────────────────────────
+_dispenser_sound_stop = threading.Event()
+_dispenser_proc       = None
+_shutdown = threading.Event()
+_finish_tts_lock = threading.Lock()      # 급수 완료 TTS 중복 방지용
+_last_finish_tts_time = 0.0              # 마지막 급수 완료 안내 시각
+_voice_audio_restart_request = threading.Event()  # 급수 후 음성 입력 스트림 재시작 요청
+
+# silero-VAD 모델을 voice_loop 진입마다 다시 받지 않고 프로세스당 1회만 로드해 캐시한다.
+# 급수 후 스트림 재시작 시 voice_loop가 재실행되어도 torch.hub.load가 반복되지 않게 한다.
+_vad_model_cache = None
+_vad_model_lock = threading.Lock()
+
+# voice_loop가 동시에 몇 개 살아 있는지 추적하는 진단용 카운터.
+# 정상 상태에서는 항상 1이어야 한다. 2 이상이면 중복 실행(watchdog 재시작) 의심.
+_voice_loop_active_count = 0
+_voice_loop_count_lock = threading.Lock()
+
+
+def get_voice_loop_active_count() -> int:
+    """현재 살아 있는 voice_loop 인스턴스 수(진단용)."""
+    with _voice_loop_count_lock:
+        return int(_voice_loop_active_count)
+
+
+
+def _get_vad_model():
+    """silero-VAD 모델을 1회만 로드해 캐시 후 재사용한다."""
+    global _vad_model_cache
+    with _vad_model_lock:
+        if _vad_model_cache is None:
+            log_info('silero-VAD 로드 중...')
+            model, _ = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                trust_repo=True,
+            )
+            _vad_model_cache = model
+            log_info('silero-VAD 로드 완료')
+        else:
+            log_info('silero-VAD 캐시 재사용')
+        return _vad_model_cache
+
+# ════════════════════════════════════════════════════════════════════
+#  상태 정의
+# ════════════════════════════════════════════════════════════════════
+
+MODE_SLEEP                  = 'SLEEP'
+MODE_COMMAND                = 'COMMAND'          # 지능형 명령 분기
+MODE_CONFIRM_LEVEL          = 'CONFIRM_LEVEL'    # 수위 확인 대기
+MODE_ASK_LEVEL              = 'ASK_LEVEL'        # 수위 미설정 시 수위 질문
+MODE_WAIT_CUP_FOUND         = 'WAIT_CUP_FOUND'
+MODE_AFTER_CUP_FOUND        = 'AFTER_CUP_FOUND'  # 컵 찾은 뒤 정수기 안내 여부/다음 명령 대기
+MODE_WAIT_DISPENSER_ARRIVAL = 'WAIT_DISPENSER_ARRIVAL'
+MODE_SELECT_LEVEL           = 'SELECT_LEVEL'
+MODE_READY_TO_POUR          = 'READY_TO_POUR'
+MODE_POURING                = 'POURING'
+
+# ════════════════════════════════════════════════════════════════════
+#  키워드
+# ════════════════════════════════════════════════════════════════════
+
+WAKE_WORDS = [
+    '지니야', '진이야', '지니아', '진희야', '제니야','최미영','세비야',
+    '지니', '지니어', '지니 야', '도비야', '우석아', '가희야','세 명','세미','새미','미야',
+    '먹고싶다', '마시고싶다', '세미야', '아쿠야', '새미야', '샘이야','샘','쌤이야','덕배야',
+]
+KW_DISPENSER = ['정수기', '정숙이', '경숙이', '정수경', '저기', '전국이', '정국이','여기']
+KW_CUP       = ['컵', '겁', '껍', 'cup', '터보']
+KW_LOCATION  = [
+    '어디', '위치', '찾아', '안내', '알려', '어딨',
+    '어디야', '어디있', '어디에', '어딘', '어디서',
+    '찾아줘', '알려줘', '안내해', '있어',
+]
+KW_START = [
+    '시작', '틀어', '받아', '나와', '줘',
+    '시작해', '틀어줘', '받아줘', '나와라',
+    '해줘', '해 줘', '부어', '부어줘', '따라', '따라줘',
+    '채워', '채워줘', '내놔', '깔아줘', '빨아줘', '깔 아줘', '빨 아줘', '깔아 줘', '빨아 줘'
+]
+KW_STOP    = ['멈춰', '정지', '그만', '꺼', '중지', '스톱', 'stop',
+              '멈춰줘', '꺼줘', '그만해', '중지해']
+KW_WATER   = ['물', '급수']
+KW_ARRIVAL = ['도착', '왔어', '도착했어', '정수기 왔어',
+               '정수기 도착', '앞이야', '앞에 왔어', '도착 완료']
+KW_CANCEL  = ['취소', '종료', '그만할래', '처음으로', '나가기', '안먹을래', '시발','미친 새끼야',]
+LEVEL_WORD_MAP = {
+    '반만': 50, '반절': 50, '절반': 50,
+    '가득': 90, '꽉': 90, '풀': 90,
+}
+
+VALID_LEVELS = [50, 60, 70, 80, 90]
+
+
+# ════════════════════════════════════════════════════════════════════
+#  사용자 GUI 표시 단어 보정표
+# ════════════════════════════════════════════════════════════════════
+# 내부 명령 판정에는 영향 없음. 화면에 표시되는 STT 문장만 정리한다.
+# 새 단어를 추가하려면 아래 DISPLAY_WORD_GROUPS에 항목만 추가하면 된다.
+# mode:
+#   - 'substring': 문장 안에 해당 별칭이 들어오면 바로 치환. 대상어 보정에 적합.
+#   - 'phrase'   : 공백까지 포함한 짧은 명령구 치환. "물줘" → "물 줘" 같은 표현에 적합.
+#   - 'token'    : 띄어쓰기 단위 단어만 치환. 과도한 부분 치환 방지에 적합.
+# fuzzy:
+#   - True이면 token 단위로 비슷한 발음/오인식도 지정 단어로 보정한다.
+#   - 한 글자 단어는 오인식 위험이 커서 fuzzy를 권장하지 않는다.
+DISPLAY_WORD_GROUPS = [
+    {
+        'canonical': '정수기',
+        'aliases': ['정수기', '정숙이', '경숙이', '정수경', '전국이', '정국이'],
+        'mode': 'substring',
+        'fuzzy': True,
+        'threshold': 0.82,
+    },
+    {
+        'canonical': '컵',
+        'aliases': ['컵', '겁', '껍', 'cup', '터보'],
+        'mode': 'substring',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    
+    {
+        'canonical': '50%',
+        'aliases': ['50%', '50프로', '50퍼센트', '오십프로', '오십 퍼센트', '오십퍼센트', '반만', '반절', '절반'],
+        'mode': 'phrase',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    {
+        'canonical': '60%',
+        'aliases': ['60%', '60프로', '60퍼센트', '육십프로', '육십 퍼센트', '육십퍼센트'],
+        'mode': 'phrase',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    {
+        'canonical': '70%',
+        'aliases': ['70%', '70프로', '70퍼센트', '칠십프로', '칠십 퍼센트', '칠십퍼센트'],
+        'mode': 'phrase',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    {
+        'canonical': '80%',
+        'aliases': ['80%', '80프로', '80퍼센트', '팔십프로', '팔십 퍼센트', '팔십퍼센트'],
+        'mode': 'phrase',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    {
+        'canonical': '90%',
+        'aliases': ['90%', '90프로', '90퍼센트', '구십프로', '구십 퍼센트', '구십퍼센트'],
+        'mode': 'phrase',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    {
+        'canonical': '따라줘',
+        'aliases': ['깔아줘', '빨아줘', '깔 아줘', '빨 아줘', '깔아 줘', '빨아 줘'],
+        'mode': 'substring',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    {
+        'canonical': '급수',
+        'aliases': ['급소'],
+        'mode': 'substring',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+    {
+        'canonical': '물',
+        'aliases': ['불'],
+        'mode': 'substring',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
+]
+# ════════════════════════════════════════════════════════════════════
+#  로그
+# ════════════════════════════════════════════════════════════════════
+
+def ts():
+    return time.strftime('%H:%M:%S')
+
+def log_info(msg):  print(f'  [{ts()}] {msg}',       flush=True)
+def log_dbg(msg):   print(f'  [{ts()}] [DBG] {msg}', flush=True)
+
+def log_result(label, detail=''):
+    extra = f' -> {detail}' if detail else ''
+    print(f'  [RESULT] [{ts()}] {label}{extra}', flush=True)
+
+def log_header(title):
+    print(flush=True)
+    print('-' * 60, flush=True)
+    print(f'  {title}', flush=True)
+    print('-' * 60, flush=True)
+
+# ════════════════════════════════════════════════════════════════════
+#  초음파 센서
+# ════════════════════════════════════════════════════════════════════
+
+_GPIO_READY = False
+_trig_pin   = None
+_echo_pin   = None
+
+
+def _init_ultrasonic():
+    global _GPIO_READY, _trig_pin, _echo_pin
+    if _GPIO_READY:
+        return
+    try:
+        from gpiozero import OutputDevice as _OD, InputDevice as _ID
+        _trig_pin   = _OD(ULTRASONIC_TRIG_GPIO, initial_value=False)
+        _echo_pin   = _ID(ULTRASONIC_ECHO_GPIO, pull_up=False)
+        _GPIO_READY = True
+        log_info(f'초음파 GPIO 초기화 완료 (TRIG={ULTRASONIC_TRIG_GPIO}, ECHO={ULTRASONIC_ECHO_GPIO})')
+    except Exception as e:
+        log_info(f'[WARN] 초음파 GPIO 초기화 실패: {e}')
+
+
+def _measure_distance_cm() -> float:
+    if not _GPIO_READY or _trig_pin is None or _echo_pin is None:
+        return 9999.0
+    try:
+        _trig_pin.off()
+        time.sleep(0.000002)
+        _trig_pin.on()
+        time.sleep(0.00001)
+        _trig_pin.off()
+
+        t0 = time.time()
+        while not _echo_pin.value:
+            if time.time() - t0 > ULTRASONIC_TIMEOUT:
+                return 9999.0
+        echo_start = time.time()
+
+        while _echo_pin.value:
+            if time.time() - echo_start > ULTRASONIC_TIMEOUT:
+                return 9999.0
+        echo_end = time.time()
+
+        return round((echo_end - echo_start) * 34300.0 / 2.0, 1)
+    except Exception as e:
+        log_dbg(f'초음파 측정 오류: {e}')
+        return 9999.0
+
+
+def is_dispenser_arrived() -> bool:
+    hit = 0
+    for _ in range(ARRIVED_CONFIRM_CNT):
+        dist = _measure_distance_cm()
+        if DEBUG:
+            log_dbg(f'초음파 거리: {dist:.1f} cm')
+        if dist <= ARRIVED_DISTANCE_CM:
+            hit += 1
+        time.sleep(0.05)
+    arrived = hit >= ARRIVED_CONFIRM_CNT
+    if arrived:
+        log_result('정수기 도착 감지', f'초음파 {hit}/{ARRIVED_CONFIRM_CNT}회 확인')
+    return arrived
+
+# ════════════════════════════════════════════════════════════════════
+#  GUI 제어 브릿지
+# ════════════════════════════════════════════════════════════════════
+
+_gui_on_cb    = None
+_gui_off_cb   = None
+_gui_level_cb = None   # 수위 설정 시 GUI 슬라이더 갱신용 콜백
+
+
+def register_gui_callbacks(on_cb, off_cb):
+    global _gui_on_cb, _gui_off_cb
+    _gui_on_cb  = on_cb
+    _gui_off_cb = off_cb
+
+
+def register_gui_level_callback(cb):
+    """GUI 슬라이더 갱신 콜백 등록. gui_app.py 에서 호출."""
+    global _gui_level_cb
+    _gui_level_cb = cb
+
+
+def voice_start_water():
+    import smart_water_core as core
+    with core.lock:
+        if core.is_filling:
+            log_info('[급수] 이미 급수 중 — 시작 무시')
+            return
+    if _gui_on_cb:
+        _gui_on_cb()
+    else:
+        core.ensure_audio_stream()
+        core.start_filling_local()
+        def _delayed():
+            time.sleep(core.NOISE_CALIBRATION_TIME + 0.1)
+            with core.lock:
+                still = bool(core.is_filling)
+            if still:
+                core.solenoid_on()
+        threading.Thread(target=_delayed, daemon=True).start()
+    log_info('[급수] 시작 요청')
+
+
+def voice_stop_water():
+    import smart_water_core as core
+    if _gui_off_cb:
+        _gui_off_cb()
+    else:
+        core.solenoid_off()
+        core.stop_filling_local(save_result=True)
+    log_info('[급수] 정지 요청')
+
+
+def is_water_target_reached() -> bool:
+    import smart_water_core as core
+    with core.lock:
+        return bool(core.request_finish)
+
+# ════════════════════════════════════════════════════════════════════
+#  ESP32 컵 위치 알림
+# ════════════════════════════════════════════════════════════════════
+
+def cup_locator_start():
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/start', timeout=2)
+        log_info(f'컵 위치 알림 시작 요청: {r.status_code}')
+        return r.status_code == 200
+    except Exception as e:
+        log_info(f'컵 위치 알림 시작 실패: {e}')
+        return False
+
+def cup_locator_stop():
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/stop', timeout=2)
+        log_info(f'컵 위치 알림 정지 요청: {r.status_code}')
+        return r.status_code == 200
+    except Exception as e:
+        log_info(f'컵 위치 알림 정지 실패: {e}')
+        return False
+
+def cup_locator_reset():
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/reset', timeout=2)
+        return r.status_code == 200
+    except Exception as e:
+        log_info(f'컵 위치 상태 초기화 실패: {e}')
+        return False
+
+def is_cup_found() -> bool:
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/status', timeout=2)
+        if r.status_code != 200:
+            return False
+        status = r.json()
+        if DEBUG:
+            log_dbg(f'컵 위치 알림 상태: {status}')
+        return bool(status.get('cup_found', False))
+    except Exception as e:
+        log_info(f'컵 위치 상태 확인 실패: {e}')
+        return False
+
+# ════════════════════════════════════════════════════════════════════
+#  TTS + 음원 재생
+# ════════════════════════════════════════════════════════════════════
+
+async def _make_tts(text: str):
+    comm = edge_tts.Communicate(
+        text=text, voice=TTS_VOICE,
+        rate=TTS_RATE, volume=TTS_VOLUME, pitch=TTS_PITCH,
+    )
+    await comm.save(TTS_FILE)
+
+
+def _tts_gui_state(text: str):
+    """TTS 안내 문장을 사용자 GUI에 표시하기 위해 core 상태값에 저장한다."""
+    try:
+        import smart_water_core as core                         # 순환 import 방지용 함수 내부 import
+        clean_text = str(text).strip()                           # None/공백 문장 방지
+        if not clean_text:                                       # 빈 문장이면 표시하지 않음
+            return
+        with core.lock:                                          # GUI 주기 갱신과 충돌 방지
+            core.last_tts_text = clean_text                      # GUI에 표시할 안내 문장
+            core.last_tts_time = time.time()                     # 마지막 안내 시각
+    except Exception as e:
+        log_dbg(f'TTS GUI 상태 갱신 오류: {e}')                  # 실패해도 TTS 자체는 계속 진행
+
+
+def _voice_ready_gui_state(ready=None, text=None, remain_sec=None):
+    """사용자 GUI에 '지금 말해도 되는지'를 표시하기 위한 상태값을 갱신한다."""
+    try:
+        import smart_water_core as core                         # 순환 import 방지용 함수 내부 import
+        with core.lock:                                          # GUI 주기 갱신과 충돌 방지
+            if ready is not None:
+                core.voice_ready = bool(ready)                   # True이면 실제 음성 입력 대기 상태
+            if text is not None:
+                core.voice_ready_text = str(text)                # GUI에 표시할 대기/처리 상태 문구
+                core.voice_ready_time = time.time()              # 마지막 상태 갱신 시각
+            if remain_sec is not None:
+                # 발화 대기 중 남은 시간(초). 음수 방지. -1이면 '표시 안 함' 의미로 사용.
+                core.voice_remain_sec = float(remain_sec)        # GUI 카운트다운 표시용 남은 시간
+                core.voice_remain_time = time.time()             # 남은 시간 갱신 시각(오래되면 GUI가 무시)
+    except Exception as e:
+        log_dbg(f'음성 대기 상태 갱신 오류: {e}')                # 실패해도 음성 루프는 계속 진행
+
+
+
+def speak(text: str):
+    log_info(f'[TTS] "{text}"')
+    _voice_ready_gui_state(False, VOICE_BUSY_TEXT)               # TTS 중에는 사용자 발화를 받지 않음을 표시
+    _tts_gui_state(text)                                         # 음성 출력 전 GUI 안내 문장 먼저 갱신
+    if not USE_TTS:
+        _voice_ready_gui_state(False, '잠시 후 말씀해 주세요')     # cooldown 이후 listen_text에서 ready로 바뀜
+        return
+    try:
+        asyncio.run(_make_tts(text))
+        subprocess.run(
+            ['ffmpeg', '-y', '-i', TTS_FILE, '-f', 'alsa', 'plughw:4,0'],
+            timeout=15,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(TTS_FILE):
+            os.remove(TTS_FILE)
+    except Exception as e:
+        log_info(f'TTS 오류: {e}')
+    finally:
+        # 실제 수신 가능 시점은 voice_loop의 TTS_COOLDOWN 이후 collect_speech()가 시작될 때다.
+        _voice_ready_gui_state(False, '잠시 후 말씀해 주세요')
+
+
+
+def request_voice_audio_restart(reason: str = 'manual'):
+    """
+    음성인식 입력 스트림을 안전하게 재시작하도록 voice_loop에 요청한다.
+    급수 분석 스트림과 음성 입력 스트림이 같은 USB 오디오 장치를 건드린 뒤
+    VAD/아우라 반응이 느려지는 현상을 줄이기 위한 복구용이다.
+    """
+    try:
+        _voice_audio_restart_request.set()
+        log_info(f'[VOICE_RESTART] 요청됨: {reason}')
+    except Exception as e:
+        log_info(f'[VOICE_RESTART] 요청 오류: {e}')
+
+
+def notify_water_finished(source: str = 'gui'):
+    """
+    사용자 GUI 자동 정지에서도 급수 완료 안내를 보장한다.
+    인식률 관련 VAD/STT/전처리 파라미터는 변경하지 않는다.
+    """
+    global _last_finish_tts_time
+
+    now = time.time()
+    with _finish_tts_lock:
+        if now - _last_finish_tts_time < 4.0:                  # 중복 안내 방지
+            return
+        _last_finish_tts_time = now                            # 마지막 안내 시각 갱신
+
+    def _worker():
+        try:
+            log_info(f'[FINISH_TTS] 급수 완료 안내 요청 ({source})')  # 완료 안내 로그
+            speak('급수가 완료되었습니다')                         # 완료 TTS 출력
+        except Exception as e:
+            log_info(f'[FINISH_TTS] 오류: {e}')                  # 오류가 나도 음성 루프는 유지
+
+    threading.Thread(target=_worker, daemon=True).start()       # GUI 메인 루프를 막지 않음
+
+
+def _play_sound_once(path: str):
+    global _dispenser_proc
+    try:
+        _dispenser_proc = subprocess.Popen(
+            ['ffmpeg', '-y', '-i', path, '-f', 'alsa', 'plughw:4,0'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+        _dispenser_proc.wait()
+    except Exception as e:
+        log_info(f'[WARN] 음원 재생 실패: {e}')
+    finally:
+        _dispenser_proc = None
+
+
+def action_dispenser_location():
+    """0001.mp3 를 도착할 때까지 반복 재생 (별도 스레드)."""
+    log_result('정수기 위치 안내 실행')
+    _dispenser_sound_stop.clear()
+
+    def _loop():
+        while not _dispenser_sound_stop.is_set():
+            if not os.path.exists(DISPENSER_SOUND_PATH):
+                log_info(f'[WARN] 음원 파일 없음: {DISPENSER_SOUND_PATH}')
+                break
+            _play_sound_once(DISPENSER_SOUND_PATH)
+            if not _dispenser_sound_stop.is_set():
+                time.sleep(0.2)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+def stop_dispenser_sound():
+    """ffmpeg 프로세스를 프로세스 그룹 단위로 즉시 강제 종료."""
+    global _dispenser_proc
+    _dispenser_sound_stop.set()
+
+    proc = _dispenser_proc
+    if proc and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception as e:
+            log_dbg(f'음원 강제 종료 오류: {e}')
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    _dispenser_proc = None
+    time.sleep(0.3)
+    log_info('[SOUND] 정수기 안내 음원 즉시 정지')
+
+
+def action_cup_location():
+    log_result('컵 위치 안내 실행')
+    cup_locator_reset()
+    cup_locator_start()
+
+
+def set_water_level(percent: int):
+    """
+    목표 수위를 설정한다.
+    1) smart_water_core.TARGET_FILL_PCT 반영
+    2) GUI 슬라이더/표시 갱신 콜백 호출
+    """
+    import smart_water_core as core
+    core.TARGET_FILL_PCT = float(percent)
+    log_info(f'[CORE] TARGET_FILL_PCT → {percent}%')
+
+    # GUI 슬라이더 동기화 (메인 스레드 안전하게 호출)
+    if _gui_level_cb:
+        try:
+            _gui_level_cb(float(percent))
+        except Exception as e:
+            log_dbg(f'GUI 레벨 콜백 오류: {e}')
+
+# ════════════════════════════════════════════════════════════════════
+#  오디오 처리 (음성인식용)
+# ════════════════════════════════════════════════════════════════════
+
+def rms(audio):
+    if audio is None or audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(audio ** 2)))
+
+
+def clean_audio(audio):
+    """STT 입력용 전처리. noisereduce 후 RMS를 TARGET_RMS 근처로 맞춘다."""
+    cleaned = audio.copy().astype(np.float32)
+    if NOISE_REDUCE:
+        time.sleep(0.001)   # GIL 양보: 무거운 noisereduce 직전에 GUI에 실행 기회를 준다.
+        try:
+            cleaned = nr.reduce_noise(
+                y=cleaned, sr=VOICE_SAMPLE_RATE,
+                stationary=False, prop_decrease=NOISE_PROP_DECREASE,
+                n_fft=512, hop_length=128,
+            ).astype(np.float32)
+        except Exception as e:
+            log_dbg(f'noisereduce 오류: {e}')
+        time.sleep(0.001)   # GIL 양보: noisereduce 직후 GUI 프레임이 밀린 만큼 따라잡게 한다.
+    r = rms(cleaned)
+    if r > 0.0001:
+        gain = min(TARGET_RMS / r, MAX_GAIN)
+        cleaned = np.clip(cleaned * gain, -1.0, 1.0)
+    return cleaned.astype(np.float32)
+
+
+def _voice_gui_state(active=None, volume=None, text=None):
+    """사용자 GUI의 음성 아우라/인식 문장 표시용 상태값을 갱신한다."""
+    try:
+        import smart_water_core as core
+        with core.lock:
+            if active is not None:
+                core.voice_active = bool(active)
+            if volume is not None:
+                core.mic_volume = max(0.0, min(1.0, float(volume)))
+            if text is not None:
+                core.last_recognized_text = str(text)
+                core.last_recognized_time = time.time()
+    except Exception as e:
+        log_dbg(f'음성 GUI 상태 갱신 오류: {e}')
+
+
+def _chunk_volume(chunk):
+    """마이크 RMS를 GUI 아우라 크기용 0.0~1.0 값으로 변환한다."""
+    return max(0.0, min(1.0, rms(chunk) * 18.0))
+
+
+def collect_speech(stream, vad_model, max_seconds):
+    _voice_gui_state(active=False, volume=0.0)
+    _voice_ready_gui_state(True, VOICE_READY_TEXT)               # 이 함수가 시작된 순간부터 실제 발화 수신 가능
+
+    if max_seconds <= 0:
+        return None
+
+    pre_roll_n = max(1, int(PRE_ROLL_MS   / VAD_CHUNK_MS))
+    pad_n      = max(1, int(SPEECH_PAD_MS / VAD_CHUNK_MS))
+    min_n      = max(1, int(MIN_SPEECH_MS / VAD_CHUNK_MS))
+    max_chunks = int(max_seconds * 1000 / VAD_CHUNK_MS)
+
+    pre_roll      = collections.deque(maxlen=pre_roll_n)
+    speech_frames = []
+    speaking      = False
+    silence_cnt   = 0
+    read_fail_count = 0
+
+    # 발화 대기 카운트다운(남은 발화 가능 시간) 표시용.
+    # 매 VAD 청크(~32ms)마다 갱신하면 GIL 부하가 커지므로 0.2초에 한 번만 GUI 상태를 갱신한다.
+    listen_start_t   = time.time()
+    last_remain_push = 0.0
+    REMAIN_PUSH_INTERVAL = 0.2
+
+    vad_model.reset_states()
+    try:
+        for _ in range(max_chunks):
+            try:
+                data, _ = stream.read(VAD_CHUNK_SIZE)
+                read_fail_count = 0
+            except Exception as e:
+                read_fail_count += 1
+                log_info(f'[VOICE_READ_ERROR] {type(e).__name__}: {e} ({read_fail_count}/{VOICE_READ_FAIL_LIMIT})')
+                _voice_gui_state(active=False, volume=0.0, text='음성 입력 오류')
+                if read_fail_count >= VOICE_READ_FAIL_LIMIT:
+                    raise RuntimeError('음성 마이크 스트림 read 연속 실패') from e
+                time.sleep(0.05)
+                continue
+
+            chunk = (data[:, 0] if data.ndim > 1 else data.flatten()).astype(np.float32)
+            prob  = vad_model(torch.from_numpy(chunk), VOICE_SAMPLE_RATE).item()
+
+            if not speaking:
+                pre_roll.append(chunk.copy())
+
+                # 아직 발화 시작 전: 남은 발화 가능 시간을 0.2초마다 GUI에 갱신한다.
+                now_remain = time.time()
+                if now_remain - last_remain_push >= REMAIN_PUSH_INTERVAL:
+                    remain = max(0.0, max_seconds - (now_remain - listen_start_t))
+                    _voice_ready_gui_state(remain_sec=remain)
+                    last_remain_push = now_remain
+
+                if prob >= VAD_THRESHOLD:
+                    speaking    = True
+                    silence_cnt = 0
+                    speech_frames.extend(list(pre_roll))
+                    _voice_ready_gui_state(False, '듣는 중...', remain_sec=-1)  # 발화 시작 → 카운트다운 종료
+                    _voice_gui_state(active=True, volume=_chunk_volume(chunk))
+                    log_dbg(f'음성 감지 ({prob:.0%})')
+            else:
+                speech_frames.append(chunk.copy())
+                _voice_gui_state(active=True, volume=_chunk_volume(chunk))
+
+                if prob >= VAD_THRESHOLD:
+                    silence_cnt = 0
+                else:
+                    silence_cnt += 1
+                    if silence_cnt >= pad_n:
+                        break
+
+            # GIL 양보점: 매 VAD 청크 처리 후 짧게 실제로 양보해 GUI 메인 스레드(아우라)가
+            # 55ms 주기를 지킬 틈을 확실히 준다. sleep(0)은 양보 보장이 없어 1ms 실제 sleep으로 강화.
+            # VAD 청크 간격(수십 ms) 대비 1ms는 무시할 수준이라 인식 타이밍/정확도는 불변.
+            time.sleep(0.001)
+    finally:
+        vad_model.reset_states()
+        _voice_gui_state(active=False, volume=0.0)
+        _voice_ready_gui_state(remain_sec=-1)   # 수신 종료 → 카운트다운 표시 해제
+
+    if not speech_frames or len(speech_frames) < min_n:
+        return None
+
+    audio = np.concatenate(speech_frames)
+    if rms(audio) < MIN_RMS_FOR_STT:
+        return None
+
+    return audio
+
+
+_recognizer = sr.Recognizer()
+
+
+def _parse_google_alternatives(result):
+    """Google STT show_all 결과에서 후보 문장 목록을 뽑는다."""
+    alternatives = []
+    if not result:
+        return alternatives
+    if isinstance(result, dict):
+        for item in result.get('alternative', []):
+            text = str(item.get('transcript', '')).strip()
+            conf = item.get('confidence', None)
+            if text:
+                alternatives.append((text, conf))
+    elif isinstance(result, str):
+        text = result.strip()
+        if text:
+            alternatives.append((text, None))
+    return alternatives
+
+
+def _hangul_count(text):
+    """한글 글자 수를 계산한다."""
+    return len(re.findall(r'[가-힣]', str(text)))
+
+
+def _english_count(text):
+    """영문 글자 수를 계산한다."""
+    return len(re.findall(r'[A-Za-z]', str(text)))
+
+
+def _stt_candidate_score(text):
+    """프로젝트 명령어에 가까운 STT 후보에 점수를 준다."""
+    if not text:
+        return -9999.0
+
+    raw = str(text).strip()
+    n = _norm(raw)
+    shown = voice_display_text(raw)
+    sn = _norm(shown)
+    score = 0.0
+
+    if any(_norm(w) in n for w in WAKE_WORDS) or any(_norm(w) in sn for w in WAKE_WORDS):
+        score += 100.0
+    if detect_pour_start_command(raw) or detect_pour_start_command(shown):
+        score += 80.0
+    if detect_stop_command(raw) or detect_stop_command(shown):
+        score += 80.0
+    if detect_location_command(raw)[0] != 'UNKNOWN' or detect_location_command(shown)[0] != 'UNKNOWN':
+        score += 60.0
+    if detect_arrival_command(raw) or detect_arrival_command(shown):
+        score += 50.0
+
+    level_ok, _, level_reason = detect_level_command(raw)
+    shown_level_ok, _, shown_level_reason = detect_level_command(shown)
+    if level_ok or shown_level_ok:
+        score += 70.0
+    elif level_reason != 'NONE' or shown_level_reason != 'NONE':
+        score += 20.0
+
+    project_words = [
+        '물', '불', '급수', '정수기', '컵',
+        '따라', '따라줘', '받아', '받아줘', '깔아', '깔아줘', '빨아', '빨아줘',
+        '멈춰', '정지', '위치', '찾아', '퍼센트', '프로',
+    ]
+    for word in project_words:
+        if _norm(word) in n or _norm(word) in sn:
+            score += 10.0
+
+    score += min(_hangul_count(raw), 24) * 0.5
+    score -= _english_count(raw) * 2.0
+    return score
+
+
+def _audio_to_google_alternatives(audio_np, label):
+    """오디오 하나를 Google STT에 넣고 후보 문장을 반환한다."""
+    if audio_np is None or audio_np.size == 0:
+        return []
+    try:
+        audio_i16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
+        audio_data = sr.AudioData(audio_i16.tobytes(), VOICE_SAMPLE_RATE, 2)
+        result = _recognizer.recognize_google(
+            audio_data,
+            language='ko-KR',
+            show_all=True,
+        )
+        alternatives = _parse_google_alternatives(result)
+        for text, conf in alternatives:
+            log_dbg(f'[STT-{label}] 후보: "{text}" | conf={conf}')
+        return alternatives
+    except sr.UnknownValueError:
+        log_dbg(f'[STT-{label}] UnknownValueError')
+        return []
+    except sr.RequestError as e:
+        log_info(f'[WARN] STT 네트워크 오류({label}): {e}')
+        return []
+    except Exception as e:
+        log_info(f'[ERROR] STT 오류({label}): {e}')
+        return []
+
+
+def _select_best_stt_candidate(candidates):
+    """STT 후보 중 프로젝트 명령어에 가장 가까운 문장을 선택한다."""
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda x: (x['score'], x['confidence']),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def transcribe_google(audio_np):
+    """
+    clean 음성을 우선 STT에 넣고, 결과가 약하면 raw 음성 후보까지 확인한다.
+    STT 실패 여부와 관계없이 voice_loop는 계속 살아 있도록 빈 문자열만 반환한다.
+    """
+    if audio_np is None or audio_np.size == 0:
+        return ''
+
+    raw_audio = audio_np.astype(np.float32)
+    clean_np = clean_audio(raw_audio)
+    candidates = []
+
+    clean_alternatives = _audio_to_google_alternatives(clean_np, 'CLEAN')
+    for text, conf in clean_alternatives:
+        candidates.append({
+            'label': 'CLEAN',
+            'text': text,
+            'display': voice_display_text(text),
+            'score': _stt_candidate_score(text),
+            'confidence': float(conf) if conf is not None else 0.0,
+        })
+
+    best_clean = _select_best_stt_candidate(candidates[:])
+
+    # clean 결과가 프로젝트 명령어로 충분히 확실하면 raw 요청을 생략해 네트워크/CPU 부하를 줄인다.
+    if best_clean is not None and best_clean['score'] >= 60.0:
+        log_info(
+            f'[STT] 선택: {best_clean["label"]} | '
+            f'raw="{best_clean["text"]}" | '
+            f'display="{best_clean["display"]}" | '
+            f'score={best_clean["score"]:.1f}'
+        )
+        return best_clean['text'].strip()
+
+    raw_alternatives = _audio_to_google_alternatives(raw_audio, 'RAW')
+    for text, conf in raw_alternatives:
+        candidates.append({
+            'label': 'RAW',
+            'text': text,
+            'display': voice_display_text(text),
+            'score': _stt_candidate_score(text),
+            'confidence': float(conf) if conf is not None else 0.0,
+        })
+
+    best = _select_best_stt_candidate(candidates)
+    if best is None:
+        return ''
+
+    log_info(
+        f'[STT] 선택: {best["label"]} | '
+        f'raw="{best["text"]}" | '
+        f'display="{best["display"]}" | '
+        f'score={best["score"]:.1f}'
+    )
+    return best['text'].strip()
+
+
+def listen_text(stream, vad_model, max_seconds):
+    audio = collect_speech(stream, vad_model, max_seconds)
+    if audio is None:
+        return ''
+
+    _voice_ready_gui_state(False, VOICE_PROCESS_TEXT)             # STT 처리 중에는 말해도 반영되지 않음
+    text = transcribe_google(audio)
+    if text:
+        shown_text = voice_display_text(text)
+        _voice_gui_state(text=shown_text)
+        log_info(f'[STT] 인식됨: "{shown_text}"')
+    else:
+        _voice_gui_state(text='인식 실패')
+        _voice_ready_gui_state(True, '다시 말씀해 주세요')          # 실패해도 바로 다음 발화 대기 상태로 복귀
+
+    return text
+
+# ════════════════════════════════════════════════════════════════════
+#  ReSpeaker 자동 감지
+# ════════════════════════════════════════════════════════════════════
+
+def find_respeaker_device():
+    keywords = ['respeaker', 'seeed', 'xmos', 'xu316']
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] > 0:
+            for kw in keywords:
+                if kw in dev['name'].lower():
+                    return idx, dev['name']
+    return None, None
+
+# ════════════════════════════════════════════════════════════════════
+#  명령 판정
+# ════════════════════════════════════════════════════════════════════
+
+def _contains_any(text, keywords):
+    return any(kw in text for kw in keywords)
+
+def _norm(text):
+    return text.lower().replace(' ', '')
+
+def check_wake_word(text):
+    n     = _norm(text)
+    clean = re.sub(r'[^\w]', '', text)
+    # 한 글자 호출어(예: 샘, 쌤)도 인식되도록 2글자 제한을 제거한다.
+    if len(clean) < 1:
+        return False
+    return any(_norm(w) in n for w in WAKE_WORDS)
+
+def detect_stop_command(text):
+    return _contains_any(_norm(text), [_norm(k) for k in KW_STOP])
+
+def detect_cancel_command(text):
+    return _contains_any(_norm(text), [_norm(k) for k in KW_CANCEL])
+
+def detect_location_command(text):
+    t             = _norm(text)
+    has_dispenser = _contains_any(t, [_norm(k) for k in KW_DISPENSER])
+    has_cup       = _contains_any(t, [_norm(k) for k in KW_CUP])
+    has_location  = _contains_any(t, [_norm(k) for k in KW_LOCATION])
+    if has_cup and not has_dispenser:
+        return 'CUP_LOCATION',       text, 1.0 if has_location else 0.8
+    if has_dispenser and has_location:
+        return 'DISPENSER_LOCATION', text, 1.0
+    if has_dispenser:
+        return 'DISPENSER_LOCATION', text, 0.8
+    return 'UNKNOWN', text, 0.0
+
+def detect_arrival_command(text):
+    return _contains_any(_norm(text), [_norm(k) for k in KW_ARRIVAL])
+
+
+def detect_yes_command(text):
+    """정수기 위치 안내 여부 확인용 긍정 응답 판정."""
+    t = _norm(text)
+    yes_words = [
+        '응', '네', '예', '어', '좋아', '맞아', '맞어', '그래',
+        'ㅇ', '오케이', 'ok', '안내해', '알려줘', '해줘', '시작', '그대로',
+    ]
+    return _contains_any(t, [_norm(k) for k in yes_words])
+
+def _validate_level_value(lvl):
+    if lvl < 50:
+        return False, None, 'LOW'
+    if lvl > 90:
+        return False, None, 'HIGH'
+    if lvl % 10 != 0:
+        return False, None, 'NOT_STEP'
+    if lvl not in VALID_LEVELS:
+        return False, None, 'NOT_ALLOWED'
+    return True, lvl, 'OK'
+
+
+def get_level_error_message(reason):
+    if reason == 'LOW':
+        return '급수량은 50퍼센트부터 90퍼센트까지 10퍼센트 단위로만 설정할 수 있습니다'
+    if reason == 'HIGH':
+        return '최대 급수량은 90퍼센트까지만 가능합니다'
+    if reason in ('NOT_STEP', 'NOT_ALLOWED'):
+        return '급수량은 50, 60, 70, 80, 90퍼센트 중 하나로 설정해 주세요'
+    return ''
+
+
+def detect_level_command(text):
+    t = _norm(text)
+    m = re.search(r'(\d+)\s*(%|퍼센트|프로)', text)
+    if m:
+        lvl = int(m.group(1))
+        return _validate_level_value(lvl)
+    m = re.search(r'\b(\d{1,3})\b', text)
+    if m:
+        lvl = int(m.group(1))
+        return _validate_level_value(lvl)
+    for word, lvl in LEVEL_WORD_MAP.items():
+        if _norm(word) in t:
+            return True, lvl, 'OK'
+    return False, None, 'NONE'
+
+
+def detect_pour_start_command(text):
+    t       = _norm(text)
+    directs = [
+        '물줘', '물따라줘', '물받아줘', '물틀어줘',
+        '급수시작', '급수해줘',
+        '따라줘', '받아줘',
+        '깔아줘', '빨아줘', '깔 아줘', '빨 아줘', '깔아 줘', '빨아 줘',
+    ]
+    if _contains_any(t, [_norm(k) for k in directs]):
+        return True
+    return (_contains_any(t, [_norm(k) for k in KW_WATER]) and
+            _contains_any(t, [_norm(k) for k in KW_START]))
+
+# GUI 표시용 호출어 보정은 DISPLAY_WORD_GROUPS에서 처리하지 않는다.
+# 이유: '새미야' 안의 '새미', '미야'가 반복 치환되어 '새새새미미미야야야'처럼 깨질 수 있기 때문이다.
+DISPLAY_WAKE_ALIASES = [
+    '새미야', '세미야', '샘이야', '쌤이야',
+    '지니야', '진이야', '지니아', '진희야', '제니야', '시리야', '시니어',
+    '최미영', '세비야', '지니', '지니어', '지니 야',
+    '도비야', '우석아', '가희야', '세 명',
+    '세미', '새미', '미야', '샘',
+    '먹고싶다', '마시고싶다', '아쿠야', '덕배야',
+]
+
+
+def _display_compact(text: str) -> str:
+    """호출어 표시 보정용 비교 문자열을 만든다."""
+    return re.sub(r'\s+', '', str(text).lower().strip())
+
+
+def _clean_display_spaces(text: str) -> str:
+    """중복 공백을 정리한다."""
+    return re.sub(r'\s+', ' ', str(text)).strip()
+
+
+def _display_similarity(a: str, b: str) -> float:
+    """GUI 표시 보정용 문자열 유사도 계산."""
+    aa = _norm(a)
+    bb = _norm(b)
+    if not aa or not bb:
+        return 0.0
+    return difflib.SequenceMatcher(None, aa, bb).ratio()
+
+
+def _replace_display_phrases(text: str) -> str:
+    """DISPLAY_WORD_GROUPS의 phrase/substring 별칭을 먼저 치환한다."""
+    result = str(text)
+    replacements = []
+
+    for group in DISPLAY_WORD_GROUPS:
+        canonical = str(group.get('canonical', '')).strip()
+        mode = str(group.get('mode', 'phrase')).strip()
+        if not canonical or mode not in ('phrase', 'substring'):
+            continue
+        for alias in group.get('aliases', []):
+            alias = str(alias).strip()
+            if not alias:
+                continue
+            replacements.append((alias, canonical))
+
+    # 긴 별칭부터 바꿔야 "물 좀 줘"가 "물 줘"보다 먼저 안정적으로 처리된다.
+    for alias, canonical in sorted(replacements, key=lambda x: len(x[0]), reverse=True):
+        result = re.sub(re.escape(alias), canonical, result, flags=re.IGNORECASE)
+
+    return _clean_display_spaces(result)
+
+
+def _replace_display_tokens(text: str) -> str:
+    """token/fuzzy 보정. 띄어쓰기 단위 단어만 안전하게 치환한다."""
+    parts = re.split(r'(\s+)', str(text))
+    out = []
+
+    for part in parts:
+        if not part or part.isspace():
+            out.append(part)
+            continue
+
+        # 앞뒤 문장부호는 보존한다.
+        m = re.match(r'^([^0-9A-Za-z가-힣]*)([0-9A-Za-z가-힣%]+)([^0-9A-Za-z가-힣]*)$', part)
+        if not m:
+            out.append(part)
+            continue
+
+        prefix, token, suffix = m.groups()
+        token_norm = _norm(token)
+        replaced = None
+
+        for group in DISPLAY_WORD_GROUPS:
+            canonical = str(group.get('canonical', '')).strip()
+            mode = str(group.get('mode', 'phrase')).strip()
+            aliases = [str(a).strip() for a in group.get('aliases', []) if str(a).strip()]
+            fuzzy = bool(group.get('fuzzy', False))
+            threshold = float(group.get('threshold', 0.85))
+
+            if not canonical:
+                continue
+
+            # token 모드는 정확히 같은 단어만 치환한다.
+            if mode == 'token':
+                if token_norm in [_norm(a) for a in aliases + [canonical]]:
+                    replaced = canonical
+                    break
+
+            # fuzzy는 token 단위에서만 수행해 과도한 부분 치환을 막는다.
+            if fuzzy and len(token_norm) >= 2:
+                candidates = aliases + [canonical]
+                best = max((_display_similarity(token, c) for c in candidates), default=0.0)
+                if best >= threshold:
+                    replaced = canonical
+                    break
+
+        out.append(prefix + (replaced if replaced is not None else token) + suffix)
+
+    return _clean_display_spaces(''.join(out))
+
+
+def normalize_display_text(text: str) -> str:
+    """
+    STT 원문을 사용자 GUI 표시용 문장으로 정리한다.
+    내부 명령 판정에는 영향 없음.
+    """
+    if not text:
+        return ''
+
+    shown = str(text).strip()
+    shown = _replace_display_phrases(shown)
+    shown = _replace_display_tokens(shown)
+    return _clean_display_spaces(shown)
+
+
+def voice_display_text(text):
+    """STT 원문을 사용자 GUI/로그 표시용 표준 문장으로 변환한다."""
+    if not text:                                             # 빈 입력 방지
+        return ''                                            # GUI에는 빈 문자열 표시
+
+    raw = str(text).strip()                                  # STT 결과 원문 정리
+    raw_compact = _display_compact(raw)                      # 호출어 비교용 문자열
+
+    for alias in DISPLAY_WAKE_ALIASES:                       
+        if raw_compact == _display_compact(alias):            
+            return '세미야'                                  
+
+    shown = raw                                              # 호출어가 아니면 일반 표시 보정 진행
+    shown = _replace_display_phrases(shown)                  # phrase/substring 별칭 치환
+    shown = _replace_display_tokens(shown)                   # token/fuzzy 별칭 치환
+    return _clean_display_spaces(shown)                      # 중복 공백 제거 후 반환
+
+# ════════════════════════════════════════════════════════════════════
+#  음성인식 메인 루프
+# ════════════════════════════════════════════════════════════════════
+
+
+def voice_loop():
+    """
+    지니야 → 네 부르셨나요? → 명령 지능형 분기
+    기존 기능(정수기/컵 위치, 도착 대기, 급수량 선택 등) 모두 유지.
+    """
+    # silero-VAD는 프로세스당 1회만 로드한다(캐시 재사용).
+    # 급수 후 입력 스트림을 재시작해도 무거운 torch.hub.load가 반복되지 않게 한다.
+    vad_model = _get_vad_model()
+
+    # 진단용: 살아 있는 voice_loop 인스턴스 수 증가. 정상이면 1이어야 한다.
+    global _voice_loop_active_count
+    with _voice_loop_count_lock:
+        _voice_loop_active_count += 1
+        _vl_count_now = _voice_loop_active_count
+    log_info(f'[DIAG] voice_loop 진입 — 활성 인스턴스 수={_vl_count_now}'
+             + ('  *** 중복 실행 의심 ***' if _vl_count_now > 1 else ''))
+
+    mic_idx, mic_name = find_respeaker_device()
+    if VOICE_MIC_DEVICE is not None:
+        mic_idx  = VOICE_MIC_DEVICE
+        mic_name = '수동 설정'
+    log_info(f'마이크: [{mic_idx}] {mic_name}' if mic_idx is not None
+             else '마이크: 기본 장치')
+
+    def _open_voice_stream():
+        """음성 입력 sounddevice 스트림을 새로 열어 start까지 한다."""
+        s = sd.InputStream(
+            samplerate=VOICE_SAMPLE_RATE,
+            channels=VOICE_CHANNELS,
+            dtype='float32',
+            device=mic_idx,
+            blocksize=VAD_CHUNK_SIZE,
+        )
+        s.start()
+        return s
+
+    def _restart_voice_stream(old_stream):
+        """기존 스트림을 닫고 새 스트림을 연다. voice_loop는 죽이지 않는다."""
+        try:
+            old_stream.stop()
+        except Exception:
+            pass
+        try:
+            old_stream.close()
+        except Exception:
+            pass
+        new_stream = _open_voice_stream()
+        log_info('음성인식 오디오 스트림 재시작(루프 유지)')
+        return new_stream
+
+    stream = _open_voice_stream()
+    log_info('음성인식 오디오 스트림 시작')
+
+    _init_ultrasonic()
+
+    import smart_water_core as _core
+
+    mode                = MODE_SLEEP
+    selected_level      = None
+    voice_confirmed_pct = None   # 음성으로 명시 설정한 수위만 추적 (GUI 기본값 무시)
+    state_start_time    = time.time()
+    last_tts_time       = 0.0
+    header_printed      = False
+    stt_fail_count      = 0
+
+    def change_mode(new_mode):
+        nonlocal mode, state_start_time, header_printed, stt_fail_count
+        mode             = new_mode
+        state_start_time = time.time()
+        header_printed   = False
+        stt_fail_count   = 0
+
+    def tts(text):
+        nonlocal last_tts_time
+        speak(text)
+        last_tts_time = time.time()
+
+    def get_target_pct():
+        """음성으로 명시 설정된 수위만 반환. 미설정이면 0.0."""
+        return float(voice_confirmed_pct) if voice_confirmed_pct is not None else 0.0
+
+    def _do_start_pour(announce=True):
+        with _core.lock:
+            already = bool(_core.is_filling)
+        if already:
+            tts('이미 급수 중입니다')
+            return False
+        voice_start_water()
+        if announce:
+            tts('급수를 시작합니다')
+        change_mode(MODE_POURING)
+        return True
+
+    def _start_dispenser_guide():
+        log_result('정수기 위치 안내 시작')
+        tts('정수기 위치를 안내합니다')
+        action_dispenser_location()
+        change_mode(MODE_WAIT_DISPENSER_ARRIVAL)
+
+    def _handle_general_command(text):
+        """COMMAND 상태와 컵 찾은 뒤 대기 상태에서 공통으로 쓰는 명령 처리."""
+        nonlocal selected_level, voice_confirmed_pct, stt_fail_count
+
+        if detect_cancel_command(text):
+            tts('취소합니다')
+            change_mode(MODE_SLEEP)
+            return True
+
+        if detect_stop_command(text):
+            with _core.lock:
+                filling = bool(_core.is_filling)
+            if filling:
+                voice_stop_water()
+                tts('급수를 멈춥니다')
+                selected_level = None
+                change_mode(MODE_SLEEP)
+            else:
+                tts('현재 급수 중이 아닙니다')
+            return True
+
+        cmd_loc, _, _ = detect_location_command(text)
+        if cmd_loc == 'CUP_LOCATION':
+            log_result('명령 인식: 컵 위치', f'"{voice_display_text(text)}"')
+            tts('컵 위치를 안내합니다.')
+            action_cup_location()
+            change_mode(MODE_WAIT_CUP_FOUND)
+            return True
+        if cmd_loc == 'DISPENSER_LOCATION':
+            log_result('명령 인식: 정수기 위치', f'"{voice_display_text(text)}"')
+            _start_dispenser_guide()
+            return True
+
+        level_ok, level, level_reason = detect_level_command(text)
+        has_water = detect_pour_start_command(text)
+
+        if (not level_ok) and level_reason != 'NONE':
+            tts(get_level_error_message(level_reason))
+            return True
+
+        if has_water and level_ok:
+            selected_level      = level
+            voice_confirmed_pct = level
+            set_water_level(selected_level)
+            tts(f'{selected_level}퍼센트로 설정하고 급수를 시작합니다')
+            _do_start_pour(announce=False)
+        elif has_water:
+            pct = get_target_pct()
+            if pct > 0:
+                tts(f'현재 설정된 수위는 {int(pct)}퍼센트입니다. 그대로 하시겠습니까?')
+                change_mode(MODE_CONFIRM_LEVEL)
+            else:
+                tts('목표 수위가 설정되지 않았습니다. 몇 퍼센트로 채워드릴까요?')
+                change_mode(MODE_ASK_LEVEL)
+        elif level_ok:
+            selected_level      = level
+            voice_confirmed_pct = level
+            set_water_level(selected_level)
+            tts(f'{selected_level}퍼센트로 설정했습니다. 물을 따라드릴까요?')
+            # 방금 물을 따라드릴지 물었으므로, 다음 발화는 확인 응답으로 처리한다.
+            # 기존처럼 COMMAND에 남아 있으면 "어 따라 줘"를 새 급수 명령으로 오해해
+            # "현재 설정된 수위는 ... 그대로 하시겠습니까?"가 한 번 더 나오는 중복 현상이 생긴다.
+            change_mode(MODE_CONFIRM_LEVEL)
+        else:
+            stt_fail_count += 1
+            log_info(f'명령 인식 실패: "{voice_display_text(text)}"')
+            if stt_fail_count >= 2:
+                pct = get_target_pct()
+                hint = (f'현재 목표 수위는 {int(pct)}퍼센트입니다. 물을 따라드릴까요?'
+                        if pct > 0 else
+                        '물 줘, 정수기 어디야, 또는 70퍼센트 따라줘처럼 말씀해 주세요')
+                tts(hint)
+                stt_fail_count = 0
+        return True
+
+    try:
+        while True:
+            if _shutdown.is_set():
+                log_info('음성인식 루프 종료')
+                break
+
+            if _voice_audio_restart_request.is_set():
+                _voice_audio_restart_request.clear()
+                log_info('[VOICE_RESTART] 음성 입력 스트림 재시작 처리(루프 유지)')
+                # 루프를 죽이지 않고 입력 스트림만 닫았다가 다시 연다.
+                # voice_loop를 break하면 main.py watchdog이 새 스레드를 띄우면서
+                # silero-VAD 재로드 + 스트림 중복 생성으로 GUI가 영구적으로 버벅인다.
+                stream = _restart_voice_stream(stream)
+                continue
+
+            if time.time() - last_tts_time < TTS_COOLDOWN:
+                time.sleep(0.05)
+                continue
+
+            now           = time.time()
+            elapsed_state = now - state_start_time
+
+            # SLEEP
+            if mode == MODE_SLEEP:
+                if not header_printed:
+                    log_header('절전 모드 — "세미야"라고 부르면 시작합니다')
+                    header_printed = True
+                text = listen_text(stream, vad_model, MAX_WAKE_SEC)
+                if not text:
+                    continue
+                if check_wake_word(text):
+                    log_result('호출어 인식', f'"{voice_display_text(text)}"')
+                    if '덕배' in text:
+                        tts('멍멍. 부르지마라 ')
+                    else:
+                        tts('네 부르셨나요?')
+                    change_mode(MODE_COMMAND)
+
+            # MODE_COMMAND — 모든 명령 지능형 분기
+            elif mode == MODE_COMMAND:
+                if not header_printed:
+                    log_header('명령 대기 — 물 줘 / 정수기 어디야 / 70% 따라줘 등')
+                    header_printed = True
+                if elapsed_state > COMMAND_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                log_info(f'명령 입력: "{voice_display_text(text)}"')
+
+                _handle_general_command(text)
+                continue
+
+            # MODE_CONFIRM_LEVEL — 현재 수위로 진행할지 확인
+            elif mode == MODE_CONFIRM_LEVEL:
+                if not header_printed:
+                    log_header('수위 확인 대기 — 응/그래/줘 또는 다른 %로 변경')
+                    header_printed = True
+                if elapsed_state > LEVEL_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                if detect_cancel_command(text):
+                    tts('취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                # 새 수위 지정 → 해당 수위로 급수
+                level_ok, level, level_reason = detect_level_command(text)
+                if (not level_ok) and level_reason != 'NONE':
+                    tts(get_level_error_message(level_reason))
+                    continue
+                if level_ok:
+                    selected_level      = level
+                    voice_confirmed_pct = level
+                    set_water_level(selected_level)
+                    tts(f'{selected_level}퍼센트로 설정하고 급수를 시작합니다')
+                    _do_start_pour(announce=False)
+                    continue
+                # 긍정 응답 → 현재 수위 그대로 급수
+                _CONFIRM_KW = ['응','네','어','좋아','맞아','그래','줘','물줘',
+                               '시작','그렇게','그거','그대로','맞어','ㅇ']
+                t_norm = text.replace(' ','').lower()
+                if any(kw in t_norm for kw in _CONFIRM_KW) or detect_pour_start_command(text):
+                    _do_start_pour(announce=True)
+                else:
+                    stt_fail_count += 1
+                    log_info(f'확인 명령 인식 실패: "{voice_display_text(text)}"')
+                    if stt_fail_count >= 2:
+                        pct = get_target_pct()
+                        tts(f'{int(pct)}퍼센트로 진행하려면 응, 다른 수위는 숫자로 말씀해 주세요')
+                        stt_fail_count = 0
+
+            # MODE_ASK_LEVEL — 수위 미설정 시 수위 질문
+            elif mode == MODE_ASK_LEVEL:
+                if not header_printed:
+                    log_header('수위 입력 대기 — 70퍼센트 / 반만 / 가득 등')
+                    header_printed = True
+                if elapsed_state > LEVEL_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                if detect_cancel_command(text):
+                    tts('취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                level_ok, level, level_reason = detect_level_command(text)
+                if (not level_ok) and level_reason != 'NONE':
+                    tts(get_level_error_message(level_reason))
+                    continue
+                if level_ok:
+                    selected_level      = level
+                    voice_confirmed_pct = level
+                    set_water_level(selected_level)
+                    tts(f'{selected_level}퍼센트로 설정하고 급수를 시작합니다')
+                    _do_start_pour(announce=False)
+                else:
+                    stt_fail_count += 1
+                    if stt_fail_count >= 2:
+                        tts('70퍼센트, 반만, 가득 중 하나로 말씀해 주세요')
+                        stt_fail_count = 0
+
+            # MODE_WAIT_CUP_FOUND — 기존 동일
+            elif mode == MODE_WAIT_CUP_FOUND:
+                if not header_printed:
+                    log_header('컵 찾기 대기 - ESP32 컵 위치 알림 동작 중')
+                    header_printed = True
+                if elapsed_state > CUP_FOUND_TIMEOUT:
+                    cup_locator_stop()
+                    tts('컵 찾기 시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                if is_cup_found():
+                    log_result('컵 찾음 확인', 'ESP32 초음파 감지 완료')
+                    cup_locator_reset()
+                    tts('컵을 찾았습니다. 정수기 위치를 안내할까요?')
+                    change_mode(MODE_AFTER_CUP_FOUND)
+                    continue
+                time.sleep(CUP_POLL_INTERVAL)
+
+            # MODE_AFTER_CUP_FOUND — 컵을 찾은 뒤 다음 명령 또는 정수기 안내 확인
+            elif mode == MODE_AFTER_CUP_FOUND:
+                if not header_printed:
+                    log_header('컵 찾음 이후 대기 - 응/정수기 위치/물 줘/70퍼센트 등')
+                    header_printed = True
+                if elapsed_state > COMMAND_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                log_info(f'컵 찾음 이후 입력: "{voice_display_text(text)}"')
+
+                level_ok, level, level_reason = detect_level_command(text)
+                has_water   = detect_pour_start_command(text)
+                cmd_loc, _, _ = detect_location_command(text)
+
+                if (not level_ok) and level_reason != 'NONE':
+                    tts(get_level_error_message(level_reason))
+                    continue
+
+                # 사용자가 순수 긍정으로 답하면 정수기 위치 안내 시작.
+                # 단, "70퍼센트로 해줘" 또는 "물 줘"처럼 실제 명령이면 그 명령을 우선 처리한다.
+                if (not level_ok) and (not has_water) and (cmd_loc != 'CUP_LOCATION') and                    (cmd_loc == 'DISPENSER_LOCATION' or detect_yes_command(text)):
+                    log_result('정수기 위치 안내 확인', f'"{voice_display_text(text)}"')
+                    _start_dispenser_guide()
+                    continue
+
+                # 컵 찾은 뒤 "정수기 위치를 안내할까요?"라고 물은 상태에서는
+                # "물 줘"를 다시 확인 질문으로 돌리지 말고 실제 급수 명령으로 처리한다.
+                if has_water and (not level_ok) and get_target_pct() > 0:
+                    log_result('컵 찾음 이후 급수 시작 명령', f'"{voice_display_text(text)}"')
+                    _do_start_pour(announce=True)
+                    continue
+
+                _handle_general_command(text)
+                continue
+
+            # MODE_WAIT_DISPENSER_ARRIVAL — 기존 동일
+            elif mode == MODE_WAIT_DISPENSER_ARRIVAL:
+                if not header_printed:
+                    log_header('정수기 도착 대기 - 초음파 자동 감지 중')
+                    header_printed = True
+                if elapsed_state > ARRIVAL_TIMEOUT:
+                    stop_dispenser_sound()
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                if is_dispenser_arrived():
+                    stop_dispenser_sound()
+                    tts('정수기 앞에 도착하셨군요. 급수량을 선택해 주세요')
+                    change_mode(MODE_SELECT_LEVEL)
+                    continue
+                time.sleep(0.05)
+
+            # MODE_SELECT_LEVEL — 기존 동일
+            elif mode == MODE_SELECT_LEVEL:
+                if not header_printed:
+                    log_header('급수량은 50, 60, 70, 80, 90퍼센트 중 하나로 말해주세요')
+                    header_printed = True
+                if elapsed_state > LEVEL_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                if detect_cancel_command(text):
+                    tts('취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                level_ok, level, level_reason = detect_level_command(text)
+                if (not level_ok) and level_reason != 'NONE':
+                    tts(get_level_error_message(level_reason))
+                    continue
+                if level_ok:
+                    selected_level      = level
+                    voice_confirmed_pct = level
+                    set_water_level(selected_level)
+                    tts(f'수위를 {selected_level}퍼센트로 설정합니다. 물이 필요하면 물 줘라고 말해주세요')
+                    change_mode(MODE_READY_TO_POUR)
+                elif detect_pour_start_command(text):
+                    tts('먼저 급수량을 선택해 주세요')
+                else:
+                    stt_fail_count += 1
+                    if stt_fail_count >= 2:
+                        tts('급수량은 50, 60, 70, 80, 90퍼센트 중 하나로 말해주세요')
+                        stt_fail_count = 0
+
+            # MODE_READY_TO_POUR — 기존 동일
+            elif mode == MODE_READY_TO_POUR:
+                if not header_printed:
+                    log_header('급수 시작 대기 - 물 줘, 물 따라줘 등을 말하세요')
+                    header_printed = True
+                if elapsed_state > READY_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                if detect_cancel_command(text):
+                    tts('취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                if detect_stop_command(text):
+                    tts('급수를 취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                level_ok, level, level_reason = detect_level_command(text)
+                if (not level_ok) and level_reason != 'NONE':
+                    tts(get_level_error_message(level_reason))
+                    continue
+                if level_ok:
+                    selected_level      = level
+                    voice_confirmed_pct = level
+                    set_water_level(selected_level)
+                    tts(f'수위를 {selected_level}퍼센트로 다시 설정합니다. 물 줘라고 말해주세요')
+                    continue
+                if detect_pour_start_command(text):
+                    if selected_level is None:
+                        tts('먼저 급수량을 선택해 주세요')
+                        change_mode(MODE_SELECT_LEVEL)
+                    else:
+                        log_result('급수 시작 명령 인식', f'"{voice_display_text(text)}"')
+                        _do_start_pour(announce=True)
+                else:
+                    log_info(f'급수 시작 명령 아님: "{voice_display_text(text)}"')
+
+            # MODE_POURING — 기존 동일
+            elif mode == MODE_POURING:
+                if not header_printed:
+                    log_header('급수 중 - 멈춰, 정지, 그만이라고 말하면 즉시 멈춥니다')
+                    header_printed = True
+                with _core.lock:
+                    still_filling = bool(_core.is_filling)
+                if not still_filling:
+                    log_result('급수 종료 감지 (외부 정지 또는 목표 도달)')
+                    notify_water_finished(source='voice_loop')                # 중복 방지 포함 완료 안내
+                    request_voice_audio_restart('pouring_finished')           # 급수 후 입력 스트림 재시작
+                    selected_level = None
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, POUR_LISTEN_SEC)
+                if not text:
+                    continue
+                if detect_stop_command(text):
+                    log_result('급수 정지 명령 인식', f'"{voice_display_text(text)}"')
+                    voice_stop_water()
+                    tts('급수를 멈춥니다')
+                    selected_level = None
+                    change_mode(MODE_SLEEP)
+                else:
+                    log_info(f'급수 중 입력 무시: "{voice_display_text(text)}"')
+
+    except Exception as e:
+        log_info(f'[ERROR] voice_loop 예외: {e}')
+    finally:
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+        with _voice_loop_count_lock:
+            _voice_loop_active_count = max(0, _voice_loop_active_count - 1)
+            _vl_count_now = _voice_loop_active_count
+        _voice_gui_state(active=False, volume=0.0)
+        _voice_ready_gui_state(False, '음성인식 재시작 중...')
+        log_info(f'음성인식 오디오 스트림 종료 — 활성 voice_loop 수={_vl_count_now}')
