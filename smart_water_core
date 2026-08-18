@@ -147,6 +147,60 @@ REG_SPIKE_GATE       = 0.08
 SPIKE_EARLY_TIME     = 15.0
 REG_SPIKE_GATE_EARLY = REG_SPIKE_GATE * 2.5   # = 0.20
 
+# ── [v5.34-EARLY-GATE] 초반 주파수 불안정 대응 ──────────────────────
+# 499회 분석 결과, 초반(6~10초) raw 주파수가 날뛰면 회귀 r²가 떨어져
+# D/H 확정(락)이 늦어지고, 그게 최종 오차로 이어졌다.
+#
+#   초반 흔들림 5분위    락 시각    MAE    |오차|>5%p
+#     안정 Q1            8.93s     1.97      8.1%
+#     날뜀 Q5           10.74s     3.62     20.2%
+#   모델 확정 실패 6건: 초반 변동량 196Hz (정상 39Hz의 5배)
+#
+# ① 회귀 입력 게이팅 : 물리적으로 불가능한 값을 회귀 버퍼에서 배제
+# ② 지터 안전 게이트 : 초반 변동량이 크면 경고 + 무한 급수 차단
+INIT_AIR_MIN_CM = 5.5     # 초기 공기층 허용 하한 (기존 하드코딩 값을 상수화)
+INIT_AIR_MAX_CM = 16.0    # 초기 공기층 허용 상한
+DIAM_MIN_CM     = 5.0     # 지름 허용 하한 (기존 하드코딩 값을 상수화)
+DIAM_MAX_CM     = 10.0    # 지름 허용 상한
+
+# 위 H·D 허용 범위에서 물리적으로 나올 수 있는 초기 주파수 밴드.
+#   f = C / (4 * (H + K*D))  →  H,D가 클수록 낮은 주파수
+# 계산값 약 440~1183Hz. 정상 493건 중 0.8%만 밖, 넘침 6건 중 4건이 밖.
+INIT_F_PHYS_MIN_HZ = SOUND_SPEED / (4.0 * (INIT_AIR_MAX_CM + END_CORRECTION_K * DIAM_MAX_CM))
+INIT_F_PHYS_MAX_HZ = SOUND_SPEED / (4.0 * (INIT_AIR_MIN_CM + END_CORRECTION_K * DIAM_MIN_CM))
+
+REG_SPIKE_GATE_UP  = 0.20   # 상승 방향(배음 튐) 게이트. 정상 샘플의 0.73%만 차단
+EARLY_GATE_ENABLE  = True   # ①회귀 입력 게이팅 on/off
+
+JITTER_ENABLE       = True    # ②지터 안전 게이트 on/off
+JITTER_WIN_START    = 6.0     # 지터 측정 시작(초, 급수 기준)
+JITTER_WIN_END      = 8.0     # 지터 측정 종료 — 락(≈9.5초)보다 1.5초 앞섬
+JITTER_MIN_SAMPLES  = 6       # 판정에 필요한 최소 표본
+JITTER_ALERT_HZ     = 150.0   # 경고 임계. 정상 중앙값 33, 90분위 69, 99분위 194
+# D/H 미확정 상태의 강제 정지 상한.
+# 고정값(20초)으로 두면 목표 50%처럼 빨리 끝나는 시행이 그 사이 넘쳐버리므로
+# 목표 채움률에 비례해 잡는다. 아래 절편/기울기는 이 장비의 정상 시행 493건에서
+# 측정한 "목표 → 정지 시각" 관계다 (50%:10.4s, 70%:15.7s, 90%:21.5s).
+#   ※ 유량이나 용기 구성이 바뀌면 다시 재보정할 것.
+SAFETY_UNLOCKED_MAX_SEC   = 20.0   # 절대 상한
+SAFETY_UNLOCKED_MIN_SEC   = 12.0   # 절대 하한
+SAFETY_UNLOCKED_BASE_SEC  = -3.5   # 예상 정지시각 절편
+SAFETY_UNLOCKED_PER_PCT   = 0.28   # 예상 정지시각 기울기(초/%)
+SAFETY_UNLOCKED_MARGIN    = 1.6    # 여유 배수. 정상 493건 기준 오작동 0건
+SAFETY_UNLOCKED_ALERT_MUL = 0.8    # 지터 경고까지 뜬 경우 추가 단축
+
+
+def _unlocked_time_cap(target_pct: float, alerted: bool) -> float:
+    """D/H 미확정 상태로 버틸 수 있는 최대 급수 시간(초)."""
+    try:
+        expected = SAFETY_UNLOCKED_PER_PCT * float(target_pct) + SAFETY_UNLOCKED_BASE_SEC
+    except (TypeError, ValueError):
+        expected = 0.0
+    cap = expected * SAFETY_UNLOCKED_MARGIN
+    if alerted:
+        cap *= SAFETY_UNLOCKED_ALERT_MUL
+    return max(SAFETY_UNLOCKED_MIN_SEC, min(SAFETY_UNLOCKED_MAX_SEC, cap))
+
 # ── [v5.28-FILL-RATE] fill_pct 상방향 속도 제한 ─────────────────────
 FILL_PCT_RATE_LIMIT = 2.0   # %/청크, 상방향만 적용
 
@@ -305,6 +359,15 @@ last_print_time         = 0.0
 last_ai_correction_pct  = 0.0        # 정지 임계값에 실제로 반영된 보정량(%p)
 last_ai_correction_on   = False      # 이번 시행에서 보정이 적용됐는지
 last_ai_reason          = 'idle'     # 미적용 사유(insufficient_data 등)
+
+# [v5.34-EARLY-GATE] 초반 안정성 진단 상태
+early_jitter_hz         = 0.0        # 초반 창의 연속 샘플 간 평균 변동(Hz)
+jitter_alert            = False      # 초반 불안정 경고 발령 여부
+jitter_locked_in        = False      # 지터 판정이 확정됐는지(창 통과)
+_jitter_prev_raw        = 0.0        # 지터 계산용 직전 raw 값
+_jitter_diffs           = deque(maxlen=64)   # 창 안의 |Δraw| 모음
+init_f_rejected         = 0          # 물리 밴드 밖이라 배제한 회귀 입력 수
+spike_up_blocked_count  = 0          # 상승 방향 스파이크 차단 수
 
 audio_stream            = None
 lock                    = threading.Lock()
@@ -854,6 +917,8 @@ def start_filling_local() -> None:
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
     global last_ai_correction_pct, last_ai_correction_on, last_ai_reason
+    global early_jitter_hz, jitter_alert, jitter_locked_in
+    global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
 
     with lock:
         is_filling              = True
@@ -876,6 +941,13 @@ def start_filling_local() -> None:
         last_ai_correction_pct  = 0.0    # [v5.33-AI-CORR] 시행마다 보정 상태 초기화
         last_ai_correction_on   = False
         last_ai_reason          = 'idle'
+        early_jitter_hz         = 0.0    # [v5.34-EARLY-GATE] 초반 진단 상태 초기화
+        jitter_alert            = False
+        jitter_locked_in        = False
+        _jitter_prev_raw        = 0.0
+        _jitter_diffs           = deque(maxlen=64)
+        init_f_rejected         = 0
+        spike_up_blocked_count  = 0
         last_control_profile    = 'default'
         reg_time_buffer.clear()
         reg_inv_freq_buffer.clear()
@@ -980,6 +1052,8 @@ def audio_callback(indata, frames, time_info, status):
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
     global last_ai_correction_pct, last_ai_correction_on, last_ai_reason
+    global early_jitter_hz, jitter_alert, jitter_locked_in
+    global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
 
     if not is_filling:
         return
@@ -1290,6 +1364,31 @@ def audio_callback(indata, frames, time_info, status):
                 tracking_mode = True
             print(f'\n[★ 트래킹 모드] {stable_f:.0f}Hz (thresh={_tracking_thresh:.0f}Hz) 시작')
 
+        # ── [v5.34-EARLY-GATE ②] 초반 주파수 지터 측정 ──────────────
+        # 락(≈9.5초)보다 앞선 6~8초 창에서 raw 주파수의 연속 변동량을 잰다.
+        # 정상 중앙값 33Hz, 90분위 69Hz인데 확정 실패 시행은 196Hz였다.
+        if JITTER_ENABLE and not jitter_locked_in and raw_f_for_reg > 0:
+            if JITTER_WIN_START <= filling_elapsed <= JITTER_WIN_END:
+                with lock:
+                    if _jitter_prev_raw > 0:
+                        _jitter_diffs.append(abs(raw_f_for_reg - _jitter_prev_raw))
+                    _jitter_prev_raw = float(raw_f_for_reg)
+            elif filling_elapsed > JITTER_WIN_END:
+                with lock:
+                    _n = len(_jitter_diffs)
+                    if _n >= JITTER_MIN_SAMPLES:
+                        early_jitter_hz = float(np.mean(_jitter_diffs))
+                        jitter_alert    = early_jitter_hz > JITTER_ALERT_HZ
+                    jitter_locked_in = True
+                    _alert, _jit, _ok = bool(jitter_alert), float(early_jitter_hz), _n >= JITTER_MIN_SAMPLES
+                if _ok:
+                    if _alert:
+                        print(f'\n[⚠ 초반 불안정] 지터={_jit:.0f}Hz (임계 {JITTER_ALERT_HZ:.0f}Hz)'
+                              f' → 보수 모드: D/H 미확정 상한'
+                              f' {_unlocked_time_cap(TARGET_FILL_PCT, True):.1f}초')
+                    else:
+                        print(f'\n[초반 안정] 지터={_jit:.0f}Hz')
+
         # ── 8단계: 회귀 버퍼 수집 (SPIKE-UNI 적용) ──────────────────
         with lock:
             _init_f   = float(initial_stable_freq)
@@ -1313,7 +1412,24 @@ def audio_callback(indata, frames, time_info, status):
                     f' | cand={_cand_cnt}/{DIAM_CAND_MAXLEN}'
                 )
 
-            if _init_f > 0 and raw_f_for_reg > _init_f * 1.005 and raw_f_for_reg < _init_f * 4.0:
+            # ── [v5.34-EARLY-GATE ①] 회귀 입력 물리 게이팅 ──────────────
+            # init_f 가 물리적으로 불가능한 값이면(오검출) 그걸 기준으로 만든
+            # 상대 밴드 전체가 오염되므로, 아예 회귀에 넣지 않는다.
+            # 밴드는 코드가 이미 허용하는 H(5.5~16cm)·D(5~10cm)에서 유도한다.
+            _init_f_ok = True
+            if EARLY_GATE_ENABLE and _init_f > 0:
+                _init_f_ok = INIT_F_PHYS_MIN_HZ <= _init_f <= INIT_F_PHYS_MAX_HZ
+                if not _init_f_ok:
+                    with lock:
+                        init_f_rejected += 1
+                        _rej_now = int(init_f_rejected)
+                    if _rej_now == 1 or _rej_now % 25 == 0:
+                        print(f'\n[초반게이트] init_f={_init_f:.0f}Hz 가 물리 범위'
+                              f' {INIT_F_PHYS_MIN_HZ:.0f}~{INIT_F_PHYS_MAX_HZ:.0f}Hz 밖'
+                              f' → 회귀 입력 배제 ({_rej_now}회)')
+
+            if (_init_f_ok and _init_f > 0
+                    and raw_f_for_reg > _init_f * 1.005 and raw_f_for_reg < _init_f * 4.0):
                 current_inv = 1.0 / raw_f_for_reg
                 with lock:
                     _buf_snapshot = list(reg_inv_freq_buffer)
@@ -1321,7 +1437,14 @@ def audio_callback(indata, frames, time_info, status):
                 eff_gate = REG_SPIKE_GATE_EARLY if filling_elapsed < SPIKE_EARLY_TIME else REG_SPIKE_GATE
                 if len(_buf_snapshot) >= 5:
                     recent_median = float(np.median(_buf_snapshot[-5:]))
-                    spike = (current_inv - recent_median) / (recent_median + 1e-12) > eff_gate
+                    _dev = (current_inv - recent_median) / (recent_median + 1e-12)
+                    spike = _dev > eff_gate                     # 주파수 급락(기존 단방향)
+                    # [v5.34-EARLY-GATE ①] 상승 방향(배음 오검출)도 차단한다.
+                    # 주파수는 채워질수록 올라가므로 상승 게이트는 더 느슨하게 잡는다.
+                    if EARLY_GATE_ENABLE and not spike and -_dev > REG_SPIKE_GATE_UP:
+                        spike = True
+                        with lock:
+                            spike_up_blocked_count += 1
                 else:
                     spike = False
 
@@ -1521,11 +1644,21 @@ def audio_callback(indata, frames, time_info, status):
                 zone_adv      = 0.0
                 ai_adv        = 0.0
                 total_advance = STOP_ADVANCE_PCT
-                trigger       = False
+
+                # ── [v5.34-EARLY-GATE ②] 무한 급수 차단 ────────────────
+                # 기존에는 D/H 미확정이면 trigger가 영영 False라 물이 계속 나갔다.
+                # (499회 중 6건이 이 경로로 넘쳤고 실측값도 기록되지 못했다)
+                # 정상 시행의 락은 최대 18.5초이므로 20초 상한은 정상 동작을 건드리지 않는다.
+                _unlocked_cap = _unlocked_time_cap(TARGET_FILL_PCT, jitter_alert)
+                trigger = bool(JITTER_ENABLE and filling_elapsed > _unlocked_cap)
                 with lock:
                     last_decision_fill_pct = 0.0
                     last_model_valid       = False
-                    last_reject_reason     = 'no_init_air'
+                    last_reject_reason     = 'safety_stop_unlocked' if trigger else 'no_init_air'
+                if trigger:
+                    print(f'\n[⚠ 안전 정지] D/H 미확정 상태로 {filling_elapsed:.1f}초 경과'
+                          f' (상한 {_unlocked_cap:.0f}초) → 넘침 방지를 위해 정지합니다.'
+                          f' 지터={early_jitter_hz:.0f}Hz')
 
             with lock:
                 if trigger:
