@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""
+experiment_recorder.py
+======================
+스마트 정수기 실험 자동 기록 모듈.
+
+기능
+- Trial_ID 자동 생성
+- 0.2초 주기 core 상태 시계열 저장
+- 급수 종료 시 core 최종 상태 snapshot
+- 실측 채움률 입력 후 trial_summary.csv 최종 저장
+- 컵 이름(Cup_Name)별 cup_info.csv 등록/재사용
+"""
+from __future__ import annotations
+
+import csv
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+
+DATA_ROOT = Path("experiment_data")
+SUMMARY_FILE = DATA_ROOT / "trial_summary.csv"
+CUP_INFO_FILE = DATA_ROOT / "cup_info.csv"
+COUNTER_FILE = DATA_ROOT / "trial_counter.txt"
+TIMESERIES_DIR = DATA_ROOT / "timeseries"
+
+DEFAULT_SAMPLE_INTERVAL_SEC = 0.20
+DEFAULT_CODE_VERSION = "v5.32-time-q-bridge"
+
+TIMESERIES_HEADER = [
+    "Trial_ID", "Sample_Index", "Record_Elapsed_Sec", "Core_Elapsed_Sec",
+    "Is_Filling", "Target_Fill_Pct",
+    "Raw_Freq_Hz", "Stable_Freq_Hz", "F_For_Stop_Hz", "Target_Freq_Hz",
+    "Estimated_Fill_Pct", "Decision_Fill_Pct", "Current_Air_cm",
+    "Diameter_cm", "Init_Air_cm",
+    "Reg_R2", "Theory_Slope", "Theory_Intercept", "Theory_Locked",
+    "Dynamic_Q", "Noise_Floor_Level", "Spike_Blocked_Count", "Max_Freq_Seen_Hz",
+    "Tracking_Mode", "Tracking_Mode_Hits",
+    "Bridge_Active", "Bridge_Pred_Fill_Pct", "Bridge_Start_Fill_Pct",
+    "Stop_Hits", "Stop_Trigger_Count",
+    "Model_Valid", "Reject_Reason", "Control_Profile",
+]
+
+SUMMARY_HEADER = [
+    "Trial_ID", "Started_At", "Finished_At",
+    "Cup_Name", "Cup_Height_cm", "Cup_Top_Diameter_cm", "Cup_Bottom_Diameter_cm",
+    "Target_Fill_Pct", "Actual_Fill_Pct", "Fill_Error_Pct", "Actual_Air_cm",
+    "Initial_Stable_Freq_Hz", "Initial_Stable_Time_Sec",
+    "Diameter_cm", "D_Locked_cm", "D_Candidate_Median_cm", "D_Candidate_MAD_cm",
+    "Init_Air_Locked_cm", "Target_Freq_Hz",
+    "Raw_Stop_Freq_Hz", "Decision_Freq_Hz", "Stop_Freq_Hz",
+    "Decision_Fill_Pct", "Estimated_Stop_Fill_Pct", "Estimated_Stop_Air_cm",
+    "Reg_R2", "Theory_Slope", "Theory_Intercept", "Theory_Locked",
+    "Model_Valid", "Reject_Reason", "Total_Samples", "Max_Freq_Seen_Hz",
+    "Noise_Floor_Level", "Dynamic_Q", "Stop_Hits", "Stop_Trigger_Count",
+    "Spike_Blocked_Count", "Stop_Elapsed_Sec",
+    "Bridge_Used", "Bridge_Start_Elapsed_Sec", "Bridge_Start_Fill_Pct",
+    "Bridge_Start_Q", "Bridge_Start_Freq_Hz", "Bridge_Final_Pred_Fill_Pct",
+    "Control_Profile", "Flow_Rate_ml_s", "Code_Version",
+    "Timeseries_File",
+]
+
+CUP_INFO_HEADER = [
+    "Cup_Name", "Cup_Height_cm",
+    "Cup_Top_Diameter_cm", "Cup_Bottom_Diameter_cm", "Note",
+]
+
+_state_lock = threading.RLock()
+_active: Optional[Dict[str, Any]] = None
+_pending: Optional[Dict[str, Any]] = None
+
+
+def _ensure_dirs() -> None:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    TIMESERIES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get(core: Any, name: str, default: Any = 0.0) -> Any:
+    return getattr(core, name, default)
+
+
+def _bool_text(value: Any) -> str:
+    return "TRUE" if bool(value) else "FALSE"
+
+
+def _append_csv(path: Path, header: list[str], row: Dict[str, Any]) -> None:
+    _ensure_dirs()
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in header})
+
+
+def _next_trial_id() -> str:
+    _ensure_dirs()
+    next_no = 1
+    if COUNTER_FILE.exists():
+        try:
+            text = COUNTER_FILE.read_text(encoding="utf-8").strip()
+            next_no = int(text) + 1 if text else 1
+        except Exception:
+            next_no = 1
+
+    if SUMMARY_FILE.exists():
+        try:
+            with SUMMARY_FILE.open("r", newline="", encoding="utf-8-sig") as f:
+                max_no = 0
+                for row in csv.DictReader(f):
+                    trial_id = str(row.get("Trial_ID", ""))
+                    if trial_id.startswith("Trial_"):
+                        try:
+                            max_no = max(max_no, int(trial_id.split("_", 1)[1]))
+                        except Exception:
+                            pass
+                next_no = max(next_no, max_no + 1)
+        except Exception:
+            pass
+
+    COUNTER_FILE.write_text(str(next_no), encoding="utf-8")
+    return f"Trial_{next_no:04d}"
+
+
+def register_cup(
+    cup_name: str,
+    height_cm: Optional[float] = None,
+    top_diameter_cm: Optional[float] = None,
+    bottom_diameter_cm: Optional[float] = None,
+    note: str = "",
+) -> None:
+    """컵 이름(Cup_Name)을 기준으로 cup_info.csv에 등록/갱신."""
+    _ensure_dirs()
+    cup_name = (cup_name or "unknown").strip()
+
+    rows = []
+    if CUP_INFO_FILE.exists():
+        try:
+            with CUP_INFO_FILE.open("r", newline="", encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
+            rows = []
+
+    new_row = {
+        "Cup_Name": cup_name,
+        "Cup_Height_cm": "" if height_cm is None else height_cm,
+        "Cup_Top_Diameter_cm": "" if top_diameter_cm is None else top_diameter_cm,
+        "Cup_Bottom_Diameter_cm": "" if bottom_diameter_cm is None else bottom_diameter_cm,
+        "Note": note or "",
+    }
+
+    found = False
+    for idx, row in enumerate(rows):
+        if str(row.get("Cup_Name", "")).strip() == cup_name:
+            merged = dict(row)
+            for key, value in new_row.items():
+                if key == "Cup_Name" or value not in ("", None):
+                    merged[key] = value
+            rows[idx] = merged
+            found = True
+            break
+
+    if not found:
+        rows.append(new_row)
+
+    with CUP_INFO_FILE.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CUP_INFO_HEADER, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in CUP_INFO_HEADER})
+
+def _read_cup_info(cup_name: str) -> Dict[str, Any]:
+    if not CUP_INFO_FILE.exists():
+        return {}
+    try:
+        with CUP_INFO_FILE.open("r", newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if str(row.get("Cup_Name", "")).strip() == str(cup_name).strip():
+                    return row
+    except Exception:
+        pass
+    return {}
+
+def start_trial(
+    core: Any,
+    cup_name: str,
+    *,
+    cup_height_cm: Optional[float] = None,
+    cup_top_diameter_cm: Optional[float] = None,
+    cup_bottom_diameter_cm: Optional[float] = None,
+    code_version: str = DEFAULT_CODE_VERSION,
+    sample_interval_sec: float = DEFAULT_SAMPLE_INTERVAL_SEC,
+) -> str:
+    """새 실험 기록 시작. core.start_filling_local() 직후 호출 권장."""
+    global _active, _pending
+    with _state_lock:
+        if _active is not None:
+            raise RuntimeError(f"이미 기록 중: {_active['trial_id']}")
+        if _pending is not None:
+            raise RuntimeError(
+                f"실측값 저장 대기 중: {_pending['trial_id']}. finalize_trial() 후 다음 실험을 시작하세요."
+            )
+
+        trial_id = _next_trial_id()
+        register_cup(
+            cup_name,
+            height_cm=cup_height_cm,
+            top_diameter_cm=cup_top_diameter_cm,
+            bottom_diameter_cm=cup_bottom_diameter_cm,
+        )
+
+        _active = {
+            "trial_id": trial_id,
+            "cup_name": (cup_name or "unknown").strip(),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "record_start_monotonic": time.monotonic(),
+            "sample_interval_sec": max(0.05, float(sample_interval_sec)),
+            "code_version": str(code_version),
+            "timeseries": [],
+            "stop_event": threading.Event(),
+        }
+
+        worker = threading.Thread(
+            target=_timeseries_worker,
+            args=(core, trial_id),
+            daemon=True,
+            name=f"timeseries-{trial_id}",
+        )
+        _active["worker"] = worker
+        worker.start()
+        print(f"\n[REC] {trial_id} 시작 | Cup={cup_name} | Target={_get(core, 'TARGET_FILL_PCT', 0)}%")
+        return trial_id
+
+
+def _core_elapsed(core: Any) -> float:
+    try:
+        return max(
+            0.0,
+            time.time()
+            - float(_get(core, "filling_start_time", time.time()))
+            - float(_get(core, "NOISE_CALIBRATION_TIME", 0.0)),
+        )
+    except Exception:
+        return 0.0
+
+
+def _snapshot_timeseries_row(core: Any, trial_id: str, idx: int, record_elapsed: float) -> Dict[str, Any]:
+    def read_values() -> Dict[str, Any]:
+        return {
+            "Trial_ID": trial_id,
+            "Sample_Index": idx,
+            "Record_Elapsed_Sec": round(record_elapsed, 3),
+            "Core_Elapsed_Sec": round(_core_elapsed(core), 3),
+            "Is_Filling": _bool_text(_get(core, "is_filling", False)),
+            "Target_Fill_Pct": _safe_float(_get(core, "TARGET_FILL_PCT", 0.0)),
+            "Raw_Freq_Hz": _safe_float(_get(core, "last_detected_f", 0.0)),
+            "Stable_Freq_Hz": _safe_float(_get(core, "last_stable_f", 0.0)),
+            "F_For_Stop_Hz": _safe_float(_get(core, "last_f_for_stop", 0.0)),
+            "Target_Freq_Hz": _safe_float(_get(core, "target_freq", 0.0)),
+            "Estimated_Fill_Pct": _safe_float(_get(core, "last_fill_pct", 0.0)),
+            "Decision_Fill_Pct": _safe_float(_get(core, "last_decision_fill_pct", 0.0)),
+            "Current_Air_cm": _safe_float(_get(core, "last_current_air", 0.0)),
+            "Diameter_cm": _safe_float(_get(core, "current_diameter", 0.0)),
+            "Init_Air_cm": _safe_float(_get(core, "init_air_len_cm", 0.0)),
+            "Reg_R2": _safe_float(_get(core, "last_r2", 0.0)),
+            "Theory_Slope": _safe_float(_get(core, "theory_slope", 0.0)),
+            "Theory_Intercept": _safe_float(_get(core, "theory_intercept", 0.0)),
+            "Theory_Locked": _bool_text(_get(core, "theory_locked", False)),
+            "Dynamic_Q": _safe_float(_get(core, "dynamic_Q", 0.0)),
+            "Noise_Floor_Level": _safe_float(_get(core, "noise_floor_level", 0.0)),
+            "Spike_Blocked_Count": int(_safe_float(_get(core, "spike_blocked_count", 0), 0) or 0),
+            "Max_Freq_Seen_Hz": _safe_float(_get(core, "max_freq_seen", 0.0)),
+            "Tracking_Mode": _bool_text(_get(core, "tracking_mode", False)),
+            "Tracking_Mode_Hits": int(_safe_float(_get(core, "tracking_mode_hits", 0), 0) or 0),
+            "Bridge_Active": _bool_text(_get(core, "bridge_active", False)),
+            "Bridge_Pred_Fill_Pct": _safe_float(_get(core, "bridge_pred_fill_pct", 0.0)),
+            "Bridge_Start_Fill_Pct": _safe_float(_get(core, "bridge_start_fill_pct", 0.0)),
+            "Stop_Hits": int(_safe_float(_get(core, "consecutive_stop_hits", 0), 0) or 0),
+            "Stop_Trigger_Count": int(_safe_float(_get(core, "STOP_TRIGGER_COUNT", 0), 0) or 0),
+            "Model_Valid": _bool_text(_get(core, "last_model_valid", False)),
+            "Reject_Reason": str(_get(core, "last_reject_reason", "unknown")),
+            "Control_Profile": str(_get(core, "last_control_profile", "default")),
+        }
+
+    core_lock = getattr(core, "lock", None)
+    if core_lock is not None:
+        try:
+            with core_lock:
+                return read_values()
+        except Exception:
+            pass
+    return read_values()
+
+
+def _timeseries_worker(core: Any, trial_id: str) -> None:
+    idx = 0
+    while True:
+        with _state_lock:
+            state = _active
+            if state is None or state.get("trial_id") != trial_id:
+                return
+            stop_event = state["stop_event"]
+            start_mono = state["record_start_monotonic"]
+            interval = state["sample_interval_sec"]
+
+        if stop_event.is_set():
+            return
+
+        row = _snapshot_timeseries_row(core, trial_id, idx, time.monotonic() - start_mono)
+        with _state_lock:
+            if _active is None or _active.get("trial_id") != trial_id:
+                return
+            _active["timeseries"].append(row)
+
+        idx += 1
+        stop_event.wait(interval)
+
+
+def _write_timeseries(trial_id: str, rows: list[Dict[str, Any]]) -> Path:
+    _ensure_dirs()
+    path = TIMESERIES_DIR / f"{trial_id}.csv"
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=TIMESERIES_HEADER, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in TIMESERIES_HEADER})
+    return path
+
+
+def _snapshot_summary(core: Any) -> Dict[str, Any]:
+    def read_values() -> Dict[str, Any]:
+        return {
+            "Target_Fill_Pct": _safe_float(_get(core, "TARGET_FILL_PCT", 0.0)),
+            "Initial_Stable_Freq_Hz": _safe_float(_get(core, "initial_stable_freq", 0.0)),
+            "Initial_Stable_Time_Sec": _safe_float(_get(core, "initial_stable_time", 0.0)),
+            "Diameter_cm": _safe_float(_get(core, "current_diameter", 0.0)),
+            "D_Locked_cm": _safe_float(_get(core, "last_d_locked_cm", 0.0)),
+            "D_Candidate_Median_cm": _safe_float(_get(core, "last_d_candidate_median", 0.0)),
+            "D_Candidate_MAD_cm": _safe_float(_get(core, "last_d_candidate_mad", 0.0)),
+            "Init_Air_Locked_cm": _safe_float(_get(core, "last_init_air_locked_cm", _get(core, "init_air_len_cm", 0.0))),
+            "Target_Freq_Hz": _safe_float(_get(core, "target_freq", 0.0)),
+            "Raw_Stop_Freq_Hz": _safe_float(_get(core, "last_raw_stop_freq", 0.0)),
+            "Decision_Freq_Hz": _safe_float(_get(core, "last_decision_freq", 0.0)),
+            "Stop_Freq_Hz": _safe_float(_get(core, "last_stable_f", 0.0)),
+            "Decision_Fill_Pct": _safe_float(_get(core, "last_decision_fill_pct", 0.0)),
+            "Estimated_Stop_Fill_Pct": _safe_float(_get(core, "last_fill_pct", 0.0)),
+            "Estimated_Stop_Air_cm": _safe_float(_get(core, "last_current_air", 0.0)),
+            "Reg_R2": _safe_float(_get(core, "last_r2", 0.0)),
+            "Theory_Slope": _safe_float(_get(core, "theory_slope", 0.0)),
+            "Theory_Intercept": _safe_float(_get(core, "theory_intercept", 0.0)),
+            "Theory_Locked": _bool_text(_get(core, "theory_locked", False)),
+            "Model_Valid": _bool_text(_get(core, "last_model_valid", False)),
+            "Reject_Reason": str(_get(core, "last_reject_reason", "unknown")),
+            "Total_Samples": len(list(_get(core, "history_freq_snapshot", []))),
+            "Max_Freq_Seen_Hz": _safe_float(_get(core, "max_freq_seen", 0.0)),
+            "Noise_Floor_Level": _safe_float(_get(core, "noise_floor_level", 0.0)),
+            "Dynamic_Q": _safe_float(_get(core, "dynamic_Q", 0.0)),
+            "Stop_Hits": int(_safe_float(_get(core, "consecutive_stop_hits", 0), 0) or 0),
+            "Stop_Trigger_Count": int(_safe_float(_get(core, "STOP_TRIGGER_COUNT", 0), 0) or 0),
+            "Spike_Blocked_Count": int(_safe_float(_get(core, "spike_blocked_count", 0), 0) or 0),
+            "Stop_Elapsed_Sec": _safe_float(_get(core, "last_stop_elapsed_sec", 0.0)),
+            "Bridge_Used": _bool_text(_get(core, "bridge_active", False)),
+            "Bridge_Start_Elapsed_Sec": _safe_float(_get(core, "bridge_start_elapsed", 0.0)),
+            "Bridge_Start_Fill_Pct": _safe_float(_get(core, "bridge_start_fill_pct", 0.0)),
+            "Bridge_Start_Q": _safe_float(_get(core, "bridge_start_q", 0.0)),
+            "Bridge_Start_Freq_Hz": _safe_float(_get(core, "bridge_start_freq", 0.0)),
+            "Bridge_Final_Pred_Fill_Pct": _safe_float(_get(core, "bridge_pred_fill_pct", 0.0)),
+            "Control_Profile": str(_get(core, "last_control_profile", "default")),
+            "Flow_Rate_ml_s": _safe_float(_get(core, "FLOW_RATE", 0.0)),
+        }
+
+    core_lock = getattr(core, "lock", None)
+    if core_lock is not None:
+        try:
+            with core_lock:
+                return read_values()
+        except Exception:
+            pass
+    return read_values()
+
+
+def capture_finish(core: Any) -> Optional[str]:
+    """급수 종료 직후 호출. 시계열 저장 + core 최종 상태 snapshot."""
+    global _active, _pending
+    with _state_lock:
+        if _active is None:
+            return None
+        state = _active
+        state["stop_event"].set()
+
+    worker = state.get("worker")
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=1.0)
+
+    try:
+        state["timeseries"].append(
+            _snapshot_timeseries_row(
+                core,
+                state["trial_id"],
+                len(state["timeseries"]),
+                time.monotonic() - state["record_start_monotonic"],
+            )
+        )
+    except Exception:
+        pass
+
+    ts_path = _write_timeseries(state["trial_id"], state["timeseries"])
+    snap = _snapshot_summary(core)
+
+    with _state_lock:
+        _pending = {
+            **state,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "timeseries_file": str(ts_path),
+            "summary_snapshot": snap,
+        }
+        _active = None
+
+    print(f"\n[REC] {state['trial_id']} 캡처 종료 | TS={ts_path}")
+    return state["trial_id"]
+
+
+def finalize_trial(
+    core: Any,
+    *,
+    actual_fill_pct: Optional[float],
+    actual_air_cm: Optional[float] = None,
+) -> Optional[str]:
+    """실측 채움률 입력 후 trial_summary.csv 한 줄 최종 저장."""
+    global _pending
+    with _state_lock:
+        if _pending is None:
+            return None
+        pending = dict(_pending)
+
+    snap = dict(pending["summary_snapshot"])
+    cup = _read_cup_info(pending["cup_name"])
+    target_pct = _safe_float(snap.get("Target_Fill_Pct"), 0.0) or 0.0
+    actual_pct = _safe_float(actual_fill_pct, None)
+
+    if actual_pct is not None:
+        actual_pct = max(0.0, min(100.0, actual_pct))
+        fill_error = actual_pct - target_pct
+    else:
+        fill_error = None
+
+    row = {
+        "Trial_ID": pending["trial_id"],
+        "Started_At": pending["started_at"],
+        "Finished_At": pending["finished_at"],
+        "Cup_Name": pending["cup_name"],
+        "Cup_Height_cm": cup.get("Cup_Height_cm", ""),
+        "Cup_Top_Diameter_cm": cup.get("Cup_Top_Diameter_cm", ""),
+        "Cup_Bottom_Diameter_cm": cup.get("Cup_Bottom_Diameter_cm", ""),
+        **snap,
+        "Actual_Fill_Pct": "" if actual_pct is None else round(actual_pct, 3),
+        "Fill_Error_Pct": "" if fill_error is None else round(fill_error, 3),
+        "Actual_Air_cm": "" if actual_air_cm is None else actual_air_cm,
+        "Code_Version": pending["code_version"],
+        "Timeseries_File": pending["timeseries_file"],
+    }
+
+    _append_csv(SUMMARY_FILE, SUMMARY_HEADER, row)
+    trial_id = pending["trial_id"]
+    with _state_lock:
+        _pending = None
+
+    print(f"\n[REC] {trial_id} 저장 완료 | Target={target_pct:.1f}% | Actual={actual_pct} | Error={fill_error}")
+    return trial_id
+
+
+def abort_trial() -> None:
+    global _active, _pending
+    with _state_lock:
+        if _active is not None:
+            _active["stop_event"].set()
+        _active = None
+        _pending = None
+
+
+def get_status() -> Dict[str, Any]:
+    with _state_lock:
+        return {
+            "active_trial": None if _active is None else _active.get("trial_id"),
+            "pending_trial": None if _pending is None else _pending.get("trial_id"),
+            "active": _active is not None,
+            "pending": _pending is not None,
+        }
