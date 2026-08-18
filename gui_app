@@ -568,6 +568,9 @@ def run_kiosk_gui(on_ready=None):
                 stop_list     = list(getattr(core, 'history_stop_freq', []))
                 t_mode        = bool(core.tracking_mode)
                 init_air_c    = float(core.init_air_len_cm)
+                # [v5.33-AI-CORR] 정지 임계값에 반영된 학습 보정량
+                ai_corr       = float(getattr(core, 'last_ai_correction_pct', 0.0))
+                ai_on         = bool(getattr(core, 'last_ai_correction_on', False))
 
             d_var.set(f'지름(D) : {d:.2f} cm' if d > 0 else '지름(D) : - cm')
             f_var.set(f'주파수(F) : {sf:.0f} Hz' if sf > 0 else '주파수(F) : - Hz')
@@ -575,9 +578,12 @@ def run_kiosk_gui(on_ready=None):
             # [PCT] 목표 수위: core.TARGET_FILL_PCT 직접 사용
             tf_var.set(f'목표(Target) : {core.TARGET_FILL_PCT:.1f} %' if tf > 0 else '목표(Target) : - %')
 
-            # [PCT] 현재 수위
+            # [PCT] 현재 수위 (+ [v5.33-AI-CORR] 적용된 학습 보정량)
+            #   보정이 실제로 걸린 경우에만 덧붙인다. 미적용/0%일 때는 표시하지 않아
+            #   기존 화면과 동일하게 보이도록 한다.
+            ai_txt = f'   (AI : {ai_corr:+.1f}%)' if (ai_on and abs(ai_corr) >= 0.05) else ''
             if init_air_c > 0 and fill_pct > 0:
-                air_var.set(f'수위(Level) : {fill_pct:.1f} %')
+                air_var.set(f'수위(Level) : {fill_pct:.1f} %{ai_txt}')
             else:
                 air_var.set('수위(Level) : - %')
 
