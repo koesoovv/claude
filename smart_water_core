@@ -47,6 +47,7 @@
 # ※ STOP_ADVANCE_CM, END_CORRECTION_K=0.35 변경 금지
 # ═══════════════════════════════════════════════════════════════════
 
+import sys
 import numpy as np
 import sounddevice as sd
 import scipy.signal as signal
@@ -54,6 +55,16 @@ import time
 import threading
 from collections import deque
 from gpiozero import OutputDevice, Button
+
+# [v5.33-AI-CORR] 적응형 급수 보정 모듈. 없거나 고장나도 기존 제어는 그대로 동작해야 하므로
+#                 임포트 실패를 흡수하고 fill_corrector=None 으로 두고 진행한다.
+try:
+    import fill_corrector
+except Exception as _fc_err:                                       # noqa: BLE001 - 어떤 실패든 제어를 막지 않는다
+    fill_corrector = None
+    print(f'[AI] fill_corrector 로드 실패 → 보정 없이 동작합니다 ({_fc_err})')
+
+_CORE_SELF = sys.modules[__name__]                                 # 보정 모듈이 코어 상태를 읽을 때 쓰는 자기 참조
 
 # ── 파일/GPIO 설정 ──────────────────────────────────────────────────
 CSV_FILENAME      = 'experiment_results.csv'
@@ -72,6 +83,7 @@ END_CORRECTION_K = 0.35
 # ── 제어 파라미터 ────────────────────────────────────────────────────
 TARGET_FILL_PCT         = 70.0
 STOP_ADVANCE_PCT        = 0.0
+AI_CORRECTION_ENABLE    = True   # [v5.33-AI-CORR] 학습 기반 정지 시점 보정 사용 여부
 STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
 CALC_START_TIME         = 6.0
@@ -288,6 +300,12 @@ last_model_valid        = False
 last_reject_reason      = 'not_started'
 last_control_profile    = 'default'
 last_print_time         = 0.0
+
+# [v5.33-AI-CORR] 학습 보정 상태 (로그/GUI 표시 및 온라인 학습용)
+last_ai_correction_pct  = 0.0        # 정지 임계값에 실제로 반영된 보정량(%p)
+last_ai_correction_on   = False      # 이번 시행에서 보정이 적용됐는지
+last_ai_reason          = 'idle'     # 미적용 사유(insufficient_data 등)
+
 audio_stream            = None
 lock                    = threading.Lock()
 
@@ -835,6 +853,7 @@ def start_filling_local() -> None:
     global _stag_buffer, _stag_last_log
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
+    global last_ai_correction_pct, last_ai_correction_on, last_ai_reason
 
     with lock:
         is_filling              = True
@@ -854,6 +873,9 @@ def start_filling_local() -> None:
         last_init_air_locked_cm        = 0.0
         last_model_valid        = False
         last_reject_reason      = 'not_calibrated'
+        last_ai_correction_pct  = 0.0    # [v5.33-AI-CORR] 시행마다 보정 상태 초기화
+        last_ai_correction_on   = False
+        last_ai_reason          = 'idle'
         last_control_profile    = 'default'
         reg_time_buffer.clear()
         reg_inv_freq_buffer.clear()
@@ -904,6 +926,14 @@ def start_filling_local() -> None:
         bridge_start_freq       = 0.0
         bridge_eta_sec          = 0.0
         bridge_last_log         = 0.0
+
+    # [v5.33-AI-CORR] 이전 시행(특히 중단된 시행)의 특징이 남아 다음 실측과 잘못 짝지어지는 것을 막는다.
+    if fill_corrector is not None:
+        try:
+            fill_corrector.remember_features(None)
+        except Exception:                                          # noqa: BLE001 - 초기화 실패가 급수를 막지 않는다
+            pass
+
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
 
 
@@ -949,6 +979,7 @@ def audio_callback(indata, frames, time_info, status):
     global _stag_buffer, _stag_last_log
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
+    global last_ai_correction_pct, last_ai_correction_on, last_ai_reason
 
     if not is_filling:
         return
@@ -1451,11 +1482,44 @@ def audio_callback(indata, frames, time_info, status):
 
                 zone_adv      = _get_zone_advance()
                 bridge_adv    = BRIDGE_STOP_ADVANCE_PCT if bridge_used else 0.0
-                total_advance = STOP_ADVANCE_PCT + zone_adv + bridge_adv
+
+                # ── [v5.33-AI-CORR] 학습 기반 정지 시점 보정 ──────────────
+                # "지금 멈추면 최종 오차가 얼마일까"를 예측해 임계값을 이동시킨다.
+                #   ai_adv < 0 (덜 채울 것으로 예측) → 임계값 상승 → 더 늦게 정지
+                #   ai_adv > 0 (넘칠 것으로 예측)   → 임계값 하강 → 더 일찍 정지
+                # 예측 실패/데이터 부족/모듈 부재 시 0이 되어 기존 동작과 완전히 같아진다.
+                ai_adv = 0.0
+                if AI_CORRECTION_ENABLE and fill_corrector is not None:
+                    try:
+                        ai_feat = fill_corrector.features_from_core(
+                            _CORE_SELF,
+                            fill_pct=fill_pct,
+                            current_air=current_air,
+                            stable_f=stable_f,
+                            elapsed=filling_elapsed,
+                            diameter=_cur_d2,
+                            init_air=_init_air,
+                            bridge_used=bridge_used,
+                        )
+                        ai_adv, ai_info = fill_corrector.predict_correction(ai_feat)
+                        fill_corrector.remember_features(ai_feat)   # 실측 입력 시 학습에 사용
+                        with lock:
+                            last_ai_correction_pct = float(ai_adv)
+                            last_ai_correction_on  = bool(ai_info.get('active', False))
+                            last_ai_reason         = str(ai_info.get('reason', 'ok'))
+                    except Exception as _ai_err:                    # noqa: BLE001 - 보정 실패가 급수를 막으면 안 된다
+                        ai_adv = 0.0
+                        with lock:
+                            last_ai_correction_pct = 0.0
+                            last_ai_correction_on  = False
+                            last_ai_reason         = f'error:{_ai_err.__class__.__name__}'
+
+                total_advance = STOP_ADVANCE_PCT + zone_adv + bridge_adv + ai_adv
                 trigger       = (fill_pct >= TARGET_FILL_PCT - total_advance)
             else:
                 fill_pct      = 0.0
                 zone_adv      = 0.0
+                ai_adv        = 0.0
                 total_advance = STOP_ADVANCE_PCT
                 trigger       = False
                 with lock:
@@ -1476,12 +1540,13 @@ def audio_callback(indata, frames, time_info, status):
                 fin_str    = '[F]' if in_final        else '   '
                 bar_len    = min(_hits, STOP_TRIGGER_COUNT)
                 bar        = '#' * bar_len + '-' * (STOP_TRIGGER_COUNT - bar_len)
-                adv_str    = f' adv:{total_advance:+.0f}%' if zone_adv != 0 else ''
+                adv_str    = f' adv:{total_advance:+.0f}%' if (zone_adv != 0 or ai_adv != 0) else ''
+                ai_str     = f' AI:{ai_adv:+.1f}%' if ai_adv != 0 else ''   # [v5.33-AI-CORR]
                 dscale_now = _get_diam_ema_scale(_cur_d2, fill_pct if _init_air > 0 else 0.0)
                 if _init_air > 0:
                     print(
                         f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d2:.2f}cm '
-                        f'| Level:{fill_pct:.1f}%/{TARGET_FILL_PCT:.1f}%{adv_str} '
+                        f'| Level:{fill_pct:.1f}%/{TARGET_FILL_PCT:.1f}%{adv_str}{ai_str} '
                         f'| α:{alpha_det:.2f}×{dscale_now:.2f} '
                         f'| smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz [{bar}]',
                         end='\r'
