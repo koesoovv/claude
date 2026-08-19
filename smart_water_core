@@ -411,6 +411,9 @@ init_f_retry_count      = 0          # 확정 후보를 버리고 다시 모은 
 init_f_best_candidate   = 0.0        # 밴드는 통과했지만 안정도 미달이던 최선 후보
 init_f_reject_reason    = ''         # 마지막 불합격 사유(진단용)
 
+# [v5.36-SHAPE] 실측 정합 지름 (표시/기록 전용 — 제어에는 쓰지 않는다)
+last_true_diameter_cm   = 0.0
+
 audio_stream            = None
 lock                    = threading.Lock()
 
@@ -905,6 +908,20 @@ def _regression_worker():
                     last_model_valid        = True
                     last_reject_reason      = 'ok'
                     _eff_target_air_cm = max(0.5, est * (1.0 - TARGET_FILL_PCT / 100.0))
+
+                    # [v5.36-SHAPE] 실측 정합 지름 추정 (표시/기록 전용).
+                    # 코어의 D 는 이 음향 모델의 유효 파라미터라 실제 치수와 다르다.
+                    # 제어는 기존 D 를 그대로 쓰고, 사람이 읽을 값만 따로 만든다.
+                    if fill_corrector is not None:
+                        try:
+                            _td = fill_corrector.estimate_true_diameter(_CORE_SELF)
+                            if _td is not None:
+                                last_true_diameter_cm = float(_td)
+                                print(f'\n[치수] 실측 정합 지름 {_td:.2f}cm'
+                                      f' (제어용 유효 D {_cur_d:.2f}cm)')
+                        except Exception:                          # noqa: BLE001
+                            pass
+
                     print(f'\n[★ 용기 높이 확정] {est:.2f}cm'
                           f' | offset:{h_offset:.2f}cm'
                           f' → 목표 공기층 {_eff_target_air_cm:.2f}cm ({TARGET_FILL_PCT:.0f}%)')
@@ -962,6 +979,7 @@ def start_filling_local() -> None:
     global early_jitter_hz, jitter_alert, jitter_locked_in
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
     global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
+    global last_true_diameter_cm
 
     with lock:
         is_filling              = True
@@ -994,6 +1012,7 @@ def start_filling_local() -> None:
         init_f_retry_count      = 0    # [v5.35-INITF-RETRY]
         init_f_best_candidate   = 0.0
         init_f_reject_reason    = ''
+        last_true_diameter_cm   = 0.0   # [v5.36-SHAPE]
         last_control_profile    = 'default'
         reg_time_buffer.clear()
         reg_inv_freq_buffer.clear()
@@ -1101,6 +1120,7 @@ def audio_callback(indata, frames, time_info, status):
     global early_jitter_hz, jitter_alert, jitter_locked_in
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
     global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
+    global last_true_diameter_cm
 
     if not is_filling:
         return

@@ -150,6 +150,55 @@ def load_dataset(path: str, *, verbose: bool = True):
     return np.vstack(X), np.array(y, dtype=float), meta
 
 
+def load_shape_dataset(path: str, *, verbose: bool = True):
+    """
+    요약 CSV → 치수 추정용 (X, 실제지름, 메타)
+
+    cup_info.csv 에 등록된 실제 상단/하단 지름이 있는 행만 쓴다.
+    실제 치수를 모르는 행은 학습에 쓸 수 없다.
+    """
+    records, _ = _open_summary(path)
+    X, y, meta = [], [], []
+    skipped = 0
+    for rec in records:
+        if str(rec.get('Reject_Reason', '')).strip() not in ('ok', ''):
+            skipped += 1
+            continue
+        top = _to_float(rec.get('Cup_Top_Diameter_cm'))
+        bot = _to_float(rec.get('Cup_Bottom_Diameter_cm'))
+        if top is None or bot is None or top <= 0 or bot <= 0:
+            skipped += 1                                           # 실제 치수 미등록
+            continue
+
+        vec = fc.build_shape_features(
+            initial_stable_freq_hz=_to_float(rec.get('Initial_Stable_Freq_Hz')) or 0.0,
+            theory_slope=_to_float(rec.get('Theory_Slope')) or 0.0,
+            theory_intercept=_to_float(rec.get('Theory_Intercept')) or 0.0,
+            reg_r2=_to_float(rec.get('Reg_R2')) or 0.0,
+            dynamic_q=_to_float(rec.get('Dynamic_Q')) or 0.0,
+            diameter_cm=_to_float(rec.get('Diameter_cm')) or 0.0,
+            d_candidate_median_cm=_to_float(rec.get('D_Candidate_Median_cm')) or 0.0,
+            d_candidate_mad_cm=_to_float(rec.get('D_Candidate_MAD_cm')) or 0.0,
+            init_air_cm=_to_float(rec.get('Init_Air_Locked_cm')) or 0.0,
+            noise_floor_level=_to_float(rec.get('Noise_Floor_Level')) or 0.0,
+            initial_stable_time_sec=_to_float(rec.get('Initial_Stable_Time_Sec')) or 0.0,
+        )
+        if vec is None:
+            skipped += 1
+            continue
+        X.append(vec)
+        y.append((top + bot) / 2.0)                                # 실제 평균 지름
+        meta.append({'Trial_ID': rec.get('Trial_ID', ''),
+                     'Cup_Name': rec.get('Cup_Name', ''),
+                     'Diameter_cm': _to_float(rec.get('Diameter_cm')) or 0.0})
+
+    if verbose:
+        print(f'  치수 학습 가능 {len(X)}행 (제외 {skipped})')
+    if not X:
+        raise RuntimeError('치수 학습에 쓸 수 있는 행이 없습니다. cup_info.csv 에 실제 치수를 등록하세요.')
+    return np.vstack(X), np.array(y, dtype=float), meta
+
+
 def _find_default_path() -> Optional[str]:
     for p in DEFAULT_PATHS:
         if os.path.exists(p):
@@ -195,6 +244,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     cups = sorted({m['Cup_Name'] for m in meta if m['Cup_Name']})
     if cups:
         print(f'  학습에 포함된 용기: {", ".join(cups)}')
+
+    # ── [v5.36-SHAPE] 실측 정합 지름 추정기도 함께 학습한다 ──────────
+    # 제어에는 쓰지 않고 표시/기록 전용이므로, 실패해도 경고만 남긴다.
+    try:
+        Xs, ys, ms = load_shape_dataset(path)
+        shape = fc.ShapeEstimator()
+        shape.fit(Xs, ys)
+        shape.trained_at = _dt.datetime.now().isoformat(timespec='seconds')
+        if shape.save():
+            cur = np.array([m['Diameter_cm'] for m in ms])
+            pred = np.array([shape.predict(x) or 0.0 for x in Xs])
+            print(f'[치수] 완료 → {fc.SHAPE_MODEL_FILE}')
+            print(f'  코드 추정 지름 : MAE {np.abs(cur - ys).mean():.2f} cm '
+                  f'(편향 {(cur - ys).mean():+.2f})')
+            print(f'  학습 추정 지름 : MAE {np.abs(pred - ys).mean():.2f} cm '
+                  f'(편향 {(pred - ys).mean():+.2f})  ※ 내적합')
+        else:
+            print('[치수] 저장 실패 — 표시용 지름 추정은 비활성됩니다.')
+    except Exception as exc:                                       # noqa: BLE001
+        print(f'[치수] 건너뜀: {exc}')
     return 0
 
 
