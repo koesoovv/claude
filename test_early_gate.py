@@ -162,6 +162,39 @@ check('폴백 시각이 락 예상 시각보다 늦다', core.INIT_F_FALLBACK_SE
       f'{core.INIT_F_FALLBACK_SEC}초')
 check('재측정 상태 초기값', core.init_f_retry_count == 0 and core.init_f_best_candidate == 0.0)
 
+# ── 3-3. 순간 튐 / 배음 배제 [v5.37-TRANSIENT] ──────────────────
+print('\n[3-3] 순간 튐 / 배음 배제')
+_around = [840.0, 845.0, 850.0, 855.0, 850.0]        # 주변 ≈ 850Hz
+
+# 실기 그래프에서 관측된 튐
+drop, why, ratio = core._classify_transient(1800.0, _around)
+check('실기 튐 1800Hz 를 버린다', drop, f'사유={why} 배율={ratio:.2f}')
+check('배음으로 판정한다', '배음' in why, why)
+
+for f_h, lab in ((1700.0, '2배음'), (2550.0, '3배음'), (425.0, '1/2 부저음')):
+    drop, why, _ = core._classify_transient(f_h, _around)
+    check(f'{lab} {f_h:.0f}Hz 를 버린다', drop, f'사유={why}')
+
+# 정상적인 상승은 통과해야 한다 (정상 시행 95분위가 1.129배)
+for f_ok, lab in ((880.0, '+4%'), (900.0, '+6%'), (950.0, '+12%')):
+    drop, why, _ = core._classify_transient(f_ok, _around)
+    check(f'정상 상승 {lab} 는 통과', not drop, f'사유={why}')
+
+drop, why, _ = core._classify_transient(1200.0, _around)
+check('+41% 급등은 버린다', drop, f'사유={why}')
+drop, why, _ = core._classify_transient(500.0, _around)
+check('급락도 버린다', drop, f'사유={why}')
+
+# 방어
+check('표본이 모자라면 판정 보류', not core._classify_transient(1800.0, [840, 845])[0])
+check('0Hz 는 판정 보류', not core._classify_transient(0.0, _around)[0])
+check('빈 이력이면 판정 보류', not core._classify_transient(1800.0, [])[0])
+check('임계가 정상 99분위(1.238)보다 크다', core.TRANSIENT_RATIO_UP > 1.238,
+      f'{core.TRANSIENT_RATIO_UP}')
+check('홀드오프가 있어 실제 상승을 영구 차단하지 않는다',
+      core.TRANSIENT_HOLDOFF_N >= 2, f'{core.TRANSIENT_HOLDOFF_N}')
+check('TRANSIENT_ENABLE 스위치 존재', isinstance(core.TRANSIENT_ENABLE, bool))
+
 # ── 4. 지터 설정 ────────────────────────────────────────────────
 print('\n[4] 지터 측정 설정')
 check('측정 창이 락 시각(≈9.5초)보다 먼저 끝난다', core.JITTER_WIN_END <= 9.0,
