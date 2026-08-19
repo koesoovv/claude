@@ -127,6 +127,41 @@ check('이상한 목표값(None)에도 죽지 않는다',
       core.SAFETY_UNLOCKED_MIN_SEC <= core._unlocked_time_cap(None, False)
       <= core.SAFETY_UNLOCKED_MAX_SEC)
 
+# ── 3-2. 초기 주파수 확정 검증 [v5.35-INITF-RETRY] ──────────────
+print('\n[3-2] 초기 주파수 확정 검증 / 재측정')
+import random
+random.seed(0)
+
+def _buf(center, jitter_ratio, n=10):
+    """평균 center, 상대 산포 jitter_ratio 인 표본 n개."""
+    return [center * (1 + jitter_ratio * (1 if i % 2 else -1)) for i in range(n)]
+
+# 실기에서 실제로 발생한 실패: 초반 튐이 396Hz 로 확정됨
+ok, why, sp = core._validate_init_freq(396.0, _buf(396.0, 0.02))
+check('초반 튐 396Hz 를 기각한다', not ok, f'사유={why}')
+check('기각 사유가 물리범위임', '물리범위' in why, why)
+
+# 정상 용기 (250mL 비커 계열 ~560Hz, 머그 ~1030Hz)
+for f_ok in (560.0, 750.0, 1030.0, 1150.0):
+    ok, why, sp = core._validate_init_freq(f_ok, _buf(f_ok, 0.02))
+    check(f'정상 {f_ok:.0f}Hz 안정 신호는 채택', ok, f'사유={why}')
+
+# 밴드 안이어도 요동치면 기각 (물이 바닥 때리는 구간)
+ok, why, sp = core._validate_init_freq(900.0, _buf(900.0, 0.30))
+check('밴드 안이지만 요동치면 기각', not ok, f'사유={why} 산포={sp:.2f}')
+check('기각 사유가 요동임', '요동' in why, why)
+
+# 배음 오검출
+ok, why, sp = core._validate_init_freq(1800.0, _buf(1800.0, 0.02))
+check('배음 1800Hz 를 기각한다', not ok, f'사유={why}')
+
+# 방어
+check('빈 표본이면 기각', not core._validate_init_freq(900.0, [])[0])
+check('0Hz 면 기각', not core._validate_init_freq(0.0, _buf(900.0, 0.02))[0])
+check('폴백 시각이 락 예상 시각보다 늦다', core.INIT_F_FALLBACK_SEC >= 10.0,
+      f'{core.INIT_F_FALLBACK_SEC}초')
+check('재측정 상태 초기값', core.init_f_retry_count == 0 and core.init_f_best_candidate == 0.0)
+
 # ── 4. 지터 설정 ────────────────────────────────────────────────
 print('\n[4] 지터 측정 설정')
 check('측정 창이 락 시각(≈9.5초)보다 먼저 끝난다', core.JITTER_WIN_END <= 9.0,
