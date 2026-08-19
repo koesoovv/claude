@@ -68,6 +68,7 @@ SUMMARY_HEADER = [
     "Control_Profile", "Flow_Rate_ml_s",
     "AI_Correction_Pct", "AI_Correction_On", "AI_Reason", "AI_Train_Samples",
     "Early_Jitter_Hz", "Jitter_Alert", "Init_F_Rejected", "Spike_Up_Blocked",
+    "Init_F_Retry", "Init_F_Reject_Reason",
     "Code_Version", "Timeseries_File",
 ]
 
@@ -407,6 +408,8 @@ def _snapshot_summary(core: Any) -> Dict[str, Any]:
             "Jitter_Alert": _bool_text(_get(core, "jitter_alert", False)),
             "Init_F_Rejected": int(_safe_float(_get(core, "init_f_rejected", 0), 0) or 0),
             "Spike_Up_Blocked": int(_safe_float(_get(core, "spike_up_blocked_count", 0), 0) or 0),
+            "Init_F_Retry": int(_safe_float(_get(core, "init_f_retry_count", 0), 0) or 0),
+            "Init_F_Reject_Reason": str(_get(core, "init_f_reject_reason", "")),
         }
 
     core_lock = getattr(core, "lock", None)

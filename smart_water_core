@@ -172,6 +172,17 @@ INIT_F_PHYS_MAX_HZ = SOUND_SPEED / (4.0 * (INIT_AIR_MIN_CM + END_CORRECTION_K * 
 REG_SPIKE_GATE_UP  = 0.20   # 상승 방향(배음 튐) 게이트. 정상 샘플의 0.73%만 차단
 EARLY_GATE_ENABLE  = True   # ①회귀 입력 게이팅 on/off
 
+# [v5.35-INITF-RETRY] 초기 주파수 확정 검증 + 재측정
+# SPLASH_GUARD_TIME 을 당기면 초반 튐(물이 바닥을 때리는 소리)이 초기 주파수로
+# 확정돼 버린다. 한 번 잘못 확정되면 그 값을 기준으로 만든 상대 밴드가 전부
+# 오염되고, 회귀가 영영 성립하지 않아 D 추정 자체가 실패한다.
+#   → 확정 시점에 물리 밴드와 안정도를 검사해서, 불합격이면 버리고 다시 모은다.
+#     시간이 아니라 신호가 준비됐을 때 확정되므로 가드를 앞당겨도 안전하다.
+INIT_F_VALIDATE       = True   # 확정 검증 on/off
+INIT_F_STABLE_SPREAD  = 0.15   # 버퍼 표준편차/대표값 상한 (초반 튐 구간은 이보다 크다)
+INIT_F_RETRY_MAX      = 40     # 재측정 허용 횟수 (넘으면 폴백)
+INIT_F_FALLBACK_SEC   = 12.0   # 이 시각까지 못 잡으면 그동안 본 밴드 내 최선값 사용
+
 JITTER_ENABLE       = True    # ②지터 안전 게이트 on/off
 JITTER_WIN_START    = 6.0     # 지터 측정 시작(초, 급수 기준)
 JITTER_WIN_END      = 8.0     # 지터 측정 종료 — 락(≈9.5초)보다 1.5초 앞섬
@@ -188,6 +199,32 @@ SAFETY_UNLOCKED_BASE_SEC  = -3.5   # 예상 정지시각 절편
 SAFETY_UNLOCKED_PER_PCT   = 0.28   # 예상 정지시각 기울기(초/%)
 SAFETY_UNLOCKED_MARGIN    = 1.6    # 여유 배수. 정상 493건 기준 오작동 0건
 SAFETY_UNLOCKED_ALERT_MUL = 0.8    # 지터 경고까지 뜬 경우 추가 단축
+
+
+def _validate_init_freq(candidate: float, samples) -> tuple:
+    """
+    초기 주파수 후보를 받아들일지 판정한다.
+
+    반환: (채택여부, 사유, 산포)
+      - 물리 밴드 밖  : 초반 튐이나 배음 오검출
+      - 산포가 큼     : 아직 신호가 안정되지 않음(물이 바닥을 때리는 구간)
+    """
+    try:
+        cand = float(candidate)
+        arr = np.asarray(list(samples), dtype=float)
+    except (TypeError, ValueError):
+        return False, '값 오류', 0.0
+    if not np.isfinite(cand) or cand <= 0 or arr.size == 0:
+        return False, '값 오류', 0.0
+
+    spread = float(np.std(arr)) / max(cand, 1e-9)
+    if not INIT_F_VALIDATE:
+        return True, '', spread
+    if not (INIT_F_PHYS_MIN_HZ <= cand <= INIT_F_PHYS_MAX_HZ):
+        return False, f'물리범위 {INIT_F_PHYS_MIN_HZ:.0f}~{INIT_F_PHYS_MAX_HZ:.0f}Hz 밖', spread
+    if spread > INIT_F_STABLE_SPREAD:
+        return False, f'요동 심함(산포 {spread:.2f})', spread
+    return True, '', spread
 
 
 def _unlocked_time_cap(target_pct: float, alerted: bool) -> float:
@@ -368,6 +405,11 @@ _jitter_prev_raw        = 0.0        # 지터 계산용 직전 raw 값
 _jitter_diffs           = deque(maxlen=64)   # 창 안의 |Δraw| 모음
 init_f_rejected         = 0          # 물리 밴드 밖이라 배제한 회귀 입력 수
 spike_up_blocked_count  = 0          # 상승 방향 스파이크 차단 수
+
+# [v5.35-INITF-RETRY] 초기 주파수 확정 재측정 상태
+init_f_retry_count      = 0          # 확정 후보를 버리고 다시 모은 횟수
+init_f_best_candidate   = 0.0        # 밴드는 통과했지만 안정도 미달이던 최선 후보
+init_f_reject_reason    = ''         # 마지막 불합격 사유(진단용)
 
 audio_stream            = None
 lock                    = threading.Lock()
@@ -919,6 +961,7 @@ def start_filling_local() -> None:
     global last_ai_correction_pct, last_ai_correction_on, last_ai_reason
     global early_jitter_hz, jitter_alert, jitter_locked_in
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
+    global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
 
     with lock:
         is_filling              = True
@@ -948,6 +991,9 @@ def start_filling_local() -> None:
         _jitter_diffs           = deque(maxlen=64)
         init_f_rejected         = 0
         spike_up_blocked_count  = 0
+        init_f_retry_count      = 0    # [v5.35-INITF-RETRY]
+        init_f_best_candidate   = 0.0
+        init_f_reject_reason    = ''
         last_control_profile    = 'default'
         reg_time_buffer.clear()
         reg_inv_freq_buffer.clear()
@@ -1054,6 +1100,7 @@ def audio_callback(indata, frames, time_info, status):
     global last_ai_correction_pct, last_ai_correction_on, last_ai_reason
     global early_jitter_hz, jitter_alert, jitter_locked_in
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
+    global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
 
     if not is_filling:
         return
@@ -1327,9 +1374,41 @@ def audio_callback(indata, frames, time_info, status):
                     and stable_f > INIT_STABLE_MIN_HZ):
                 init_stable_buffer.append(stable_f)
                 if len(init_stable_buffer) >= 10:
-                    initial_stable_freq = float(np.percentile(list(init_stable_buffer), 85))
-                    initial_stable_time = float(filling_elapsed)
-                    print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz | t={initial_stable_time:.1f}s')
+                    _cand = float(np.percentile(list(init_stable_buffer), 85))
+
+                    # ── [v5.35-INITF-RETRY] 확정 전 검증 ────────────────
+                    # 초반 튐 구간에서 잡힌 값은 (a) 물리적으로 불가능하거나
+                    # (b) 버퍼가 요동친다. 둘 중 하나면 버리고 다시 모은다.
+                    _accept, _why, _spread = _validate_init_freq(_cand, init_stable_buffer)
+                    if (not _accept and init_f_best_candidate == 0.0
+                            and INIT_F_PHYS_MIN_HZ <= _cand <= INIT_F_PHYS_MAX_HZ):
+                        init_f_best_candidate = _cand   # 밴드는 통과 → 폴백 후보로 보관
+
+                    if _accept:
+                        initial_stable_freq = _cand
+                        initial_stable_time = float(filling_elapsed)
+                        print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz'
+                              f' | t={initial_stable_time:.1f}s'
+                              f'{f" | 재측정 {init_f_retry_count}회" if init_f_retry_count else ""}')
+                    else:
+                        init_f_retry_count += 1
+                        init_f_reject_reason = _why
+                        init_stable_buffer.clear()          # 버리고 처음부터 다시
+                        if init_f_retry_count <= 3 or init_f_retry_count % 10 == 0:
+                            print(f'\n[초기주파수 재측정] 후보 {_cand:.0f}Hz 기각 — {_why}'
+                                  f' (재측정 {init_f_retry_count}회)')
+
+            # [v5.35-INITF-RETRY] 폴백 — 계속 못 잡으면 그동안 본 최선값이라도 쓴다.
+            # 아무것도 못 잡는 것보다는 낫고, 안 쓰면 D 추정이 영영 안 된다.
+            if (INIT_F_VALIDATE and initial_stable_freq == 0
+                    and init_f_best_candidate > 0
+                    and (filling_elapsed > INIT_F_FALLBACK_SEC
+                         or init_f_retry_count >= INIT_F_RETRY_MAX)):
+                initial_stable_freq = float(init_f_best_candidate)
+                initial_stable_time = float(filling_elapsed)
+                print(f'\n[⚠ 초기주파수 폴백] {initial_stable_freq:.0f}Hz'
+                      f' | t={initial_stable_time:.1f}s'
+                      f' | 재측정 {init_f_retry_count}회 후 최선 후보 채택')
 
         # ── [v5.30-PKFLOOR] spike 시 max_freq_seen 갱신 차단 ─────────
         with lock:
