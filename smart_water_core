@@ -179,13 +179,29 @@ REG_SPIKE_GATE_UP  = 0.20   # 상승 방향(배음 튐) 게이트. 정상 샘플
 # 정상 시행 250건 11,354샘플의 (raw / 직전5개 중앙값) 분포:
 #     50%: 1.020   90%: 1.089   95%: 1.129   99%: 1.238   99.9%: 1.790
 # → 1.35배를 넘는 상승은 정상 샘플의 0.50%뿐이라 튐으로 보고 버려도 안전하다.
-TRANSIENT_ENABLE      = True
-TRANSIENT_MED_WINDOW  = 5      # 비교 기준이 되는 최근 표본 수
-TRANSIENT_RATIO_UP    = 1.35   # 이 배율 초과 상승은 튐 의심 (정상 0.50%)
-TRANSIENT_RATIO_DOWN  = 0.70   # 이 배율 미만 급락도 튐 의심
-HARMONIC_TOL          = 0.20   # 정수배 ±20% 안이면 배음으로 판정
-HARMONIC_ORDERS       = (2.0, 3.0, 0.5)   # 2배음·3배음·1/2 부저음
-TRANSIENT_HOLDOFF_N   = 4      # 연속 이만큼 거부되면 실제 이동으로 보고 수용
+#
+# [v5.39-TRANSIENT-FIX] 초판(v5.37)의 결함 3가지를 바로잡는다.
+#   ① 급수 시작 직후의 쓰레기값이 그대로 '정상 기준'으로 박혀서, 뒤이어 들어온
+#      진짜 신호가 0.5배음으로 오판돼 통째로 버려졌다.
+#      → 기준 창의 산포가 크면 판정을 보류한다(TRANSIENT_REF_SPREAD_MAX).
+#   ② 거부된 값은 기준 이력에 넣지 않아 기준이 영원히 갱신되지 않았다.
+#      → 연속 거부값끼리 서로 일치하면 실제 이동으로 보고 기준을 통째로 교체한다.
+#   ③ 거부 시 직전 채택값을 그대로 내보내 '가짜 측정치'를 만들어냈다. 그 값이
+#      raw_f_for_reg → 회귀 버퍼까지 흘러 들어가 기울기 0인 평탄 구간을 만들고
+#      r²를 무너뜨려 지름 추정을 지연시켰다(실측 시행에서 샘플의 45%가 가짜).
+#      → 거부한 샘플은 0으로 버린다. 없는 샘플은 없는 채로 두는 것이 옳다.
+TRANSIENT_ENABLE       = True
+TRANSIENT_MED_WINDOW   = 5      # 비교 기준이 되는 최근 표본 수
+TRANSIENT_RATIO_UP     = 1.35   # 이 배율 초과 상승은 튐 의심 (정상 0.50%)
+TRANSIENT_RATIO_DOWN   = 0.55   # 이 배율 미만 급락만 튐 의심
+HARMONIC_TOL           = 0.20   # 정수배 ±20% 안이면 배음으로 판정
+HARMONIC_ORDERS        = (2.0, 3.0)   # 2배음·3배음. 0.5는 제외한다 —
+                                      # 배음에 잘못 물렸다가 기본파로 내려오는
+                                      # '자기보정'까지 막아버리기 때문.
+TRANSIENT_HOLDOFF_N    = 3      # 연속 이만큼 서로 일치하게 거부되면 실제 이동
+TRANSIENT_AGREE_TOL    = 0.10   # 연속 거부값끼리 이 산포 안이면 '일치'로 본다
+TRANSIENT_REF_SPREAD_MAX = 0.30 # 기준 창 산포가 이보다 크면 판정 보류
+                                # (정상 구간 rolling5 산포 p95 = 0.265)
 EARLY_GATE_ENABLE  = True   # ①회귀 입력 게이팅 on/off
 
 # [v5.35-INITF-RETRY] 초기 주파수 확정 검증 + 재측정
@@ -243,6 +259,18 @@ SAFETY_UNLOCKED_MARGIN    = 1.6    # 여유 배수. 정상 493건 기준 오작�
 SAFETY_UNLOCKED_ALERT_MUL = 0.8    # 지터 경고까지 뜬 경우 추가 단축
 
 
+def _spread_ratio(values) -> float:
+    """중앙값 대비 (최댓값-최솟값) 비율. 표본이 얼마나 흩어져 있는지 본다."""
+    arr = np.asarray(list(values), dtype=float)
+    arr = arr[arr > 0]
+    if arr.size == 0:
+        return 9.9
+    med = float(np.median(arr))
+    if med <= 0:
+        return 9.9
+    return float(arr.max() - arr.min()) / med
+
+
 def _classify_transient(raw_f: float, recent) -> tuple:
     """
     현재 raw 주파수가 순간 튐 / 배음인지 판정한다.
@@ -261,9 +289,18 @@ def _classify_transient(raw_f: float, recent) -> tuple:
     if not TRANSIENT_ENABLE or f <= 0 or arr.size < TRANSIENT_MED_WINDOW:
         return False, '', 1.0
 
-    med = float(np.median(arr[-TRANSIENT_MED_WINDOW:]))
+    win = arr[-TRANSIENT_MED_WINDOW:]
+    med = float(np.median(win))
     if med <= 0:
         return False, '', 1.0
+
+    # [v5.39] 기준 자체가 흔들리는 중이면 아무것도 판정하지 않는다.
+    # 급수 시작 직후의 쓰레기값이 기준으로 박히면, 뒤이어 오는 진짜 신호를
+    # 전부 배음으로 오판해 버린다. 기준이 못 미더울 땐 통과시키는 쪽이 안전하고,
+    # 그렇게 해야 오염된 값이 창 밖으로 밀려나며 스스로 회복한다.
+    if _spread_ratio(win) > TRANSIENT_REF_SPREAD_MAX:
+        return False, '기준불안정', 1.0
+
     ratio = f / med
 
     for order in HARMONIC_ORDERS:                                  # 배음이 가장 확실한 신호
@@ -497,7 +534,8 @@ trim_removed_total      = 0          # 누적 제거 점 수
 transient_blocked_count = 0          # 이번 시행에서 버린 샘플 수
 transient_holdoff       = 0          # 연속 거부 횟수 (홀드오프 판정용)
 transient_last_reason   = ''         # 마지막 배제 사유
-_transient_recent       = deque(maxlen=16)   # 채택된 raw 이력
+_transient_recent       = deque(maxlen=16)   # 채택된 raw 이력 (판정 기준)
+_transient_pending      = deque(maxlen=8)    # 연속 거부된 raw (실제 이동 판정용)
 
 audio_stream            = None
 lock                    = threading.Lock()
@@ -1120,7 +1158,7 @@ def start_filling_local() -> None:
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
     global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
     global last_true_diameter_cm, trim_retry_count, trim_removed_total
-    global transient_blocked_count, transient_holdoff, transient_last_reason, _transient_recent
+    global transient_blocked_count, transient_holdoff, transient_last_reason, _transient_recent, _transient_pending
 
     with lock:
         is_filling              = True
@@ -1160,6 +1198,7 @@ def start_filling_local() -> None:
         transient_holdoff       = 0
         transient_last_reason   = ''
         _transient_recent       = deque(maxlen=16)
+        _transient_pending      = deque(maxlen=8)
         last_control_profile    = 'default'
         reg_time_buffer.clear()
         reg_inv_freq_buffer.clear()
@@ -1268,7 +1307,7 @@ def audio_callback(indata, frames, time_info, status):
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
     global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
     global last_true_diameter_cm, trim_retry_count, trim_removed_total
-    global transient_blocked_count, transient_holdoff, transient_last_reason, _transient_recent
+    global transient_blocked_count, transient_holdoff, transient_last_reason, _transient_recent, _transient_pending
 
     if not is_filling:
         return
@@ -1380,38 +1419,56 @@ def audio_callback(indata, frames, time_info, status):
         if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
             detected_f = 0.0
 
-        # ── [v5.37-TRANSIENT] 순간 튐 / 배음 즉시 배제 ──────────────
-        # 주변 값과 비교해 물리적으로 불가능한 급변이면 그 샘플을 버리고
-        # 직전 채택값을 유지한다. 여기서 걸러야 EMA·중앙값버퍼·회귀가
-        # 모두 오염되지 않는다.
-        # 연속 TRANSIENT_HOLDOFF_N 회 거부되면 실제로 이동한 것으로 보고 받아들인다
-        # (계속 막으면 진짜 상승을 놓치기 때문).
+        # ── [v5.39-TRANSIENT-FIX] 순간 튐 / 배음 즉시 배제 ──────────
+        # 주변 값과 비교해 물리적으로 불가능한 급변이면 그 샘플을 '버린다'.
+        # 직전값으로 채워 넣지 않는다 — 그건 측정하지 않은 값을 만들어내는
+        # 것이고, raw_f_for_reg를 통해 회귀 버퍼까지 흘러 들어가 기울기 0인
+        # 평탄 구간을 만들어 r²를 무너뜨린다. 없는 샘플은 없는 채로 둔다.
+        # detected_f == 0 경로는 이미 아래에서 정상 처리된다.
+        #
+        # 연속 거부값끼리 서로 일치하면(TRANSIENT_AGREE_TOL 이내) 튐이 아니라
+        # 실제 이동이므로, 기준 이력을 그 값들로 통째로 교체해 즉시 따라간다.
+        # 한 개짜리 쓰레기값은 서로 일치할 수 없으니 절대 기준을 못 바꾼다.
         if TRANSIENT_ENABLE and detected_f > 0:
             with lock:
                 _recent_snap = list(_transient_recent)
-                _hold = int(transient_holdoff)
+                _pend_snap   = list(_transient_pending)
+                _hold        = int(transient_holdoff)
             _drop, _why, _ratio = _classify_transient(detected_f, _recent_snap)
 
-            if _drop and _hold < TRANSIENT_HOLDOFF_N:
-                _held = float(_recent_snap[-1]) if _recent_snap else 0.0
-                with lock:
-                    transient_blocked_count += 1
-                    transient_holdoff += 1
-                    transient_last_reason = _why
-                    _blk, _hold_now = int(transient_blocked_count), int(transient_holdoff)
-                if _blk <= 5 or _blk % 20 == 0:
-                    print(f'\n[튐배제] {detected_f:.0f}Hz ({_why}, 주변 대비 {_ratio:.2f}배)'
-                          f' → 무시하고 {_held:.0f}Hz 유지'
-                          f' | 누적 {_blk}회 연속 {_hold_now}/{TRANSIENT_HOLDOFF_N}')
-                detected_f = _held                                 # 직전 채택값 유지
-            else:
-                if _drop:                                          # 홀드오프 소진 = 실제 이동
+            if _drop:
+                _pend_snap.append(float(detected_f))
+                _agree = _pend_snap[-TRANSIENT_HOLDOFF_N:]
+                _real_move = (len(_agree) >= TRANSIENT_HOLDOFF_N
+                              and _spread_ratio(_agree) <= TRANSIENT_AGREE_TOL)
+
+                if _real_move:                                     # 튐이 아니라 실제 이동
                     print(f'\n[튐배제 해제] {detected_f:.0f}Hz 가 {TRANSIENT_HOLDOFF_N}회 연속'
-                          f' → 실제 변화로 판단하고 수용')
+                          f' 일관되게 관측 → 실제 변화로 판단하고 기준 교체')
+                    with lock:
+                        _transient_recent.clear()
+                        for _v in _agree:
+                            _transient_recent.append(float(_v))
+                        _transient_pending.clear()
+                        transient_holdoff = 0
+                else:                                              # 튐 → 이번 샘플 폐기
+                    with lock:
+                        transient_blocked_count += 1
+                        transient_holdoff += 1
+                        transient_last_reason = _why
+                        _transient_pending.append(float(detected_f))
+                        _blk = int(transient_blocked_count)
+                        _hold_now = int(transient_holdoff)
+                    if _blk <= 5 or _blk % 20 == 0:
+                        print(f'\n[튐배제] {detected_f:.0f}Hz ({_why}, 주변 대비 {_ratio:.2f}배)'
+                              f' → 이 샘플 폐기'
+                              f' | 누적 {_blk}회 연속 {_hold_now}')
+                    detected_f = 0.0                               # 유지가 아니라 '없음'
+            else:
                 with lock:
                     transient_holdoff = 0
-                    if detected_f > 0:
-                        _transient_recent.append(float(detected_f))
+                    _transient_pending.clear()
+                    _transient_recent.append(float(detected_f))
 
         if detected_f == 0.0:
             consecutive_loss_count += 1

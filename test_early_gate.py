@@ -182,8 +182,42 @@ for f_ok, lab in ((880.0, '+4%'), (900.0, '+6%'), (950.0, '+12%')):
 
 drop, why, _ = core._classify_transient(1200.0, _around)
 check('+41% 급등은 버린다', drop, f'사유={why}')
+drop, why, _ = core._classify_transient(450.0, _around)
+check('급락(0.53배)은 버린다', drop, f'사유={why}')
+# [v5.39] 완만한 하강은 통과시킨다. 배음에 잘못 물렸다가 기본파로 내려오는
+# 자기보정을 막으면 진짜 신호를 통째로 잃는다.
 drop, why, _ = core._classify_transient(500.0, _around)
-check('급락도 버린다', drop, f'사유={why}')
+check('완만한 하강(0.59배)은 통과', not drop, f'사유={why}')
+
+# ── [v5.39] 초판(v5.37) 결함 회귀 방지 ─────────────────────────
+# 실기 Trial_0217: 급수 직후 쓰레기값(506/1120/1238/441/1238)이 기준으로 박혀
+# 뒤이어 들어온 진짜 570Hz 를 전부 '0.5배음'으로 오판, 샘플의 45%가 가짜값으로
+# 대체되며 그래프에 직선 구간이 생기고 지름 추정이 지연됐다.
+_garbage = [506.0, 1120.0, 1238.0, 441.0, 1238.0]     # 실기에서 그대로 가져옴
+drop, why, _ = core._classify_transient(555.0, _garbage)
+check('오염된 기준으로는 판정하지 않는다', not drop, f'사유={why}')
+check('사유가 기준불안정이다', why == '기준불안정', why)
+check('오염 기준의 산포가 임계를 넘는다',
+      core._spread_ratio(_garbage) > core.TRANSIENT_REF_SPREAD_MAX,
+      f'산포={core._spread_ratio(_garbage):.3f}')
+check('정상 기준의 산포는 임계 이내',
+      core._spread_ratio(_around) <= core.TRANSIENT_REF_SPREAD_MAX,
+      f'산포={core._spread_ratio(_around):.3f}')
+
+# 0.5배음 규칙은 제거됐다 (하향 자기보정을 막지 않기 위해)
+check('HARMONIC_ORDERS 에 0.5 가 없다', 0.5 not in core.HARMONIC_ORDERS,
+      str(core.HARMONIC_ORDERS))
+
+# 연속 거부값이 서로 일치하면 '실제 이동'으로 본다
+check('일관된 연속값은 일치로 본다',
+      core._spread_ratio([555.0, 587.0, 577.0]) <= core.TRANSIENT_AGREE_TOL,
+      f'산포={core._spread_ratio([555.0, 587.0, 577.0]):.3f}')
+check('제각각인 배음 소음은 일치가 아니다',
+      core._spread_ratio([1367.0, 904.0, 1115.0]) > core.TRANSIENT_AGREE_TOL,
+      f'산포={core._spread_ratio([1367.0, 904.0, 1115.0]):.3f}')
+
+check('거부 이력 버퍼가 존재한다', hasattr(core, '_transient_pending'))
+check('거부 이력 버퍼 초기값', len(core._transient_pending) == 0)
 
 # 방어
 check('표본이 모자라면 판정 보류', not core._classify_transient(1800.0, [840, 845])[0])
