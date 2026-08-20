@@ -68,7 +68,9 @@ SUMMARY_HEADER = [
     "Control_Profile", "Flow_Rate_ml_s",
     "AI_Correction_Pct", "AI_Correction_On", "AI_Reason", "AI_Train_Samples",
     "Early_Jitter_Hz", "Jitter_Alert", "Init_F_Rejected", "Spike_Up_Blocked",
-    "Init_F_Retry", "Init_F_Reject_Reason",
+    "Init_F_Retry", "Init_F_Reject_Reason", "True_Diameter_cm",
+    "Transient_Blocked", "Transient_Last_Reason",
+    "Trim_Retry_Count", "Trim_Removed_Total",
     "Code_Version", "Timeseries_File",
 ]
 
@@ -410,6 +412,14 @@ def _snapshot_summary(core: Any) -> Dict[str, Any]:
             "Spike_Up_Blocked": int(_safe_float(_get(core, "spike_up_blocked_count", 0), 0) or 0),
             "Init_F_Retry": int(_safe_float(_get(core, "init_f_retry_count", 0), 0) or 0),
             "Init_F_Reject_Reason": str(_get(core, "init_f_reject_reason", "")),
+            # [v5.36-SHAPE] 실측 정합 지름 (표시/기록 전용)
+            "True_Diameter_cm": _safe_float(_get(core, "last_true_diameter_cm", 0.0)),
+            # [v5.37-TRANSIENT] 순간 튐/배음 배제 내역
+            "Transient_Blocked": int(_safe_float(_get(core, "transient_blocked_count", 0), 0) or 0),
+            "Transient_Last_Reason": str(_get(core, "transient_last_reason", "")),
+            # [v5.38-TRIM-RETRY] 이상치 절삭 재시도 내역
+            "Trim_Retry_Count": int(_safe_float(_get(core, "trim_retry_count", 0), 0) or 0),
+            "Trim_Removed_Total": int(_safe_float(_get(core, "trim_removed_total", 0), 0) or 0),
         }
 
     core_lock = getattr(core, "lock", None)

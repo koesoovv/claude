@@ -442,3 +442,180 @@ def status() -> Dict[str, Any]:
         'model_loaded': _loaded,
         'max_correction_pct': MAX_CORRECTION_PCT,
     }
+
+
+# ════════════════════════════════════════════════════════════════════
+#  [v5.36-SHAPE] 실측 정합 용기 치수 추정
+# ════════════════════════════════════════════════════════════════════
+#  코어의 D 추정값은 '실제 치수'가 아니라 이 음향 모델에서 맞아떨어지는
+#  유효 파라미터다. 499회 분석에서 실제 지름 대비 평균 +1.00cm 과대였고,
+#  실제 치수로 바꿔 넣으면 채움률 정확도가 오히려 나빠졌다 (MAE 4.27 -> 7.92).
+#
+#  그래서 제어에는 손대지 않고, 표시/기록용 '실측 정합 지름'만 따로 추정한다.
+#
+#      제어용 D  : 기존 그대로 (정확도 유지)
+#      표시용 D  : 아래 추정기 (실측 치수에 맞춤)
+#
+#  검증 (499회 교차검증, 실제 컵 치수 대비)
+#      코드 추정 D     MAE 1.13cm  편향 +1.00
+#      학습 추정 D     MAE 0.29cm  편향  0.00   (처음 보는 컵 0.49cm)
+#
+#  높이 H 는 학습해도 처음 보는 컵에서 오히려 나빠져(0.70 -> 1.00cm) 넣지 않았다.
+#  H 는 코어의 기존 추정(MAE 0.70cm, 상대 6.2%)이 이미 충분하다.
+
+SHAPE_MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'shape_model.json')
+
+SHAPE_FEATURES = [
+    'Initial_Stable_Freq_Hz',   # 초기 안정 주파수(Hz)
+    'Theory_Slope',             # 이론 곡선 기울기
+    'Theory_Intercept',         # 이론 곡선 절편
+    'Reg_R2',                   # 회귀 적합도
+    'Dynamic_Q',                # 동적 유량(ml/s)
+    'Diameter_cm',              # 코어의 유효 지름 추정
+    'D_Candidate_Median_cm',    # D 후보 중앙값
+    'D_Candidate_MAD_cm',       # D 후보 산포
+    'Init_Air_Locked_cm',       # 확정 초기 공기층
+    'Noise_Floor_Level',        # 노이즈 플로어
+    'Initial_Stable_Time_Sec',  # 초기 주파수 확정 시각
+    'L_Init_cm',                # C/(4·init_f) — 음향이 직접 주는 길이
+    'Inv_Slope',                # 1/|기울기| — D²에 비례하는 양
+]
+N_SHAPE = len(SHAPE_FEATURES)
+SHAPE_RIDGE_ALPHA = 10.0
+SHAPE_D_MIN_CM = 4.0        # 출력 클리핑 하한
+SHAPE_D_MAX_CM = 12.0       # 출력 클리핑 상한
+
+
+def build_shape_features(*, initial_stable_freq_hz: float, theory_slope: float,
+                         theory_intercept: float, reg_r2: float, dynamic_q: float,
+                         diameter_cm: float, d_candidate_median_cm: float,
+                         d_candidate_mad_cm: float, init_air_cm: float,
+                         noise_floor_level: float, initial_stable_time_sec: float,
+                         sound_speed: float = 34300.0) -> Optional[np.ndarray]:
+    """치수 추정용 특징 벡터. 확정(락) 이후에만 의미가 있다."""
+    init_f = _f(initial_stable_freq_hz)
+    slope = _f(theory_slope)
+    if init_f <= 0:                                                # 초기 주파수 미확정
+        return None
+
+    l_init = sound_speed / (4.0 * init_f)
+    inv_slope = 1.0 / abs(slope) if abs(slope) > 1e-12 else 0.0
+
+    vec = np.array([
+        init_f, slope, _f(theory_intercept), _f(reg_r2), _f(dynamic_q),
+        _f(diameter_cm), _f(d_candidate_median_cm), _f(d_candidate_mad_cm),
+        _f(init_air_cm), _f(noise_floor_level), _f(initial_stable_time_sec),
+        l_init, inv_slope,
+    ], dtype=float)
+    return vec if np.all(np.isfinite(vec)) else None
+
+
+class ShapeEstimator:
+    """실제 용기 지름을 맞추는 Ridge 회귀. 온라인 학습은 하지 않는다(형상은 안 변한다)."""
+
+    def __init__(self) -> None:
+        self.mean = np.zeros(N_SHAPE)
+        self.scale = np.ones(N_SHAPE)
+        self.w = np.zeros(N_SHAPE + 1)
+        self.n_samples = 0
+        self.trained_at = ''
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        self.mean = X.mean(axis=0)
+        scale = X.std(axis=0)
+        scale[~np.isfinite(scale) | (scale <= 1e-9)] = 1.0
+        self.scale = scale
+        Z = np.hstack([(X - self.mean) / self.scale, np.ones((len(X), 1))])
+        reg = np.full(N_SHAPE + 1, SHAPE_RIDGE_ALPHA)
+        reg[-1] = 1e-6                                             # 편향항은 정규화 제외
+        self.w = np.linalg.solve(Z.T @ Z + np.diag(reg), Z.T @ y)
+        self.n_samples = len(X)
+
+    def predict(self, x: Optional[np.ndarray]) -> Optional[float]:
+        """실측 정합 지름(cm). 추정 불가면 None."""
+        if x is None or self.n_samples <= 0:
+            return None
+        x = np.asarray(x, dtype=float)
+        if x.shape != (N_SHAPE,) or not np.all(np.isfinite(x)):
+            return None
+        z = np.append((x - self.mean) / self.scale, 1.0)
+        out = float(z @ self.w)
+        if not math.isfinite(out):
+            return None
+        return float(np.clip(out, SHAPE_D_MIN_CM, SHAPE_D_MAX_CM))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {'version': 1, 'feature_names': SHAPE_FEATURES,
+                'mean': self.mean.tolist(), 'scale': self.scale.tolist(),
+                'w': self.w.tolist(), 'n_samples': self.n_samples,
+                'trained_at': self.trained_at}
+
+    def load_dict(self, data: Dict[str, Any]) -> bool:
+        if list(data.get('feature_names', [])) != SHAPE_FEATURES:
+            return False
+        try:
+            self.mean = np.array(data['mean'], dtype=float)
+            self.scale = np.array(data['scale'], dtype=float)
+            self.w = np.array(data['w'], dtype=float)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if self.w.shape != (N_SHAPE + 1,):
+            return False
+        self.n_samples = int(data.get('n_samples', 0))
+        self.trained_at = str(data.get('trained_at', ''))
+        return True
+
+    def save(self, path: str = SHAPE_MODEL_FILE) -> bool:
+        try:
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.to_dict(), f, ensure_ascii=False)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            return False
+
+    def load(self, path: str = SHAPE_MODEL_FILE) -> bool:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return self.load_dict(json.load(f))
+        except (OSError, ValueError):
+            return False
+
+
+_shape = ShapeEstimator()
+_shape_loaded = _shape.load()
+
+
+def get_shape_model() -> ShapeEstimator:
+    return _shape
+
+
+def estimate_true_diameter(core: Any) -> Optional[float]:
+    """
+    코어 상태에서 실측 정합 지름(cm)을 구한다. 표시/기록 전용이며
+    제어에는 쓰지 않는다. 추정 불가 시 None.
+    """
+    if _shape.n_samples <= 0:
+        return None
+    try:
+        x = build_shape_features(
+            initial_stable_freq_hz=getattr(core, 'initial_stable_freq', 0.0),
+            theory_slope=getattr(core, 'theory_slope', 0.0),
+            theory_intercept=getattr(core, 'theory_intercept', 0.0),
+            reg_r2=getattr(core, 'last_r2', 0.0),
+            dynamic_q=getattr(core, 'dynamic_Q', 0.0),
+            diameter_cm=getattr(core, 'current_diameter', 0.0),
+            d_candidate_median_cm=getattr(core, 'last_d_candidate_median', 0.0),
+            d_candidate_mad_cm=getattr(core, 'last_d_candidate_mad', 0.0),
+            init_air_cm=getattr(core, 'init_air_len_cm', 0.0),
+            noise_floor_level=getattr(core, 'noise_floor_level', 0.0),
+            initial_stable_time_sec=getattr(core, 'initial_stable_time', 0.0),
+            sound_speed=getattr(core, 'SOUND_SPEED', 34300.0),
+        )
+        return _shape.predict(x)
+    except Exception:                                              # noqa: BLE001
+        return None

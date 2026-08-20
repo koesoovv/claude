@@ -574,8 +574,17 @@ def run_kiosk_gui(on_ready=None):
                 # [v5.34-EARLY-GATE] 초반 불안정 경고
                 jit_hz        = float(getattr(core, 'early_jitter_hz', 0.0))
                 jit_alert     = bool(getattr(core, 'jitter_alert', False))
+                true_d        = float(getattr(core, 'last_true_diameter_cm', 0.0))
 
-            d_var.set(f'지름(D) : {d:.2f} cm' if d > 0 else '지름(D) : - cm')
+            # [v5.36-SHAPE] 실측 정합 지름을 괄호로 함께 보여준다.
+            #   앞은 제어에 쓰는 유효 D, 괄호는 실제 치수에 맞춘 추정값.
+            if d > 0:
+                d_txt = f'지름(D) : {d:.2f} cm'
+                if true_d > 0:
+                    d_txt += f'   (실측 {true_d:.2f} cm)'
+                d_var.set(d_txt)
+            else:
+                d_var.set('지름(D) : - cm')
             f_var.set(f'주파수(F) : {sf:.0f} Hz' if sf > 0 else '주파수(F) : - Hz')
 
             # [PCT] 목표 수위: core.TARGET_FILL_PCT 직접 사용
