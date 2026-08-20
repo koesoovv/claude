@@ -199,6 +199,32 @@ INIT_F_STABLE_SPREAD  = 0.15   # 버퍼 표준편차/대표값 상한 (초반 �
 INIT_F_RETRY_MAX      = 40     # 재측정 허용 횟수 (넘으면 폴백)
 INIT_F_FALLBACK_SEC   = 12.0   # 이 시각까지 못 잡으면 그동안 본 밴드 내 최선값 사용
 
+# [v5.38-TRIM-RETRY] 회귀 실패 시 이상치 절삭 후 재시도
+# 락이 늦는 시행 50건을 추적한 결과, 병목은 오직 "r²가 임계를 넘는 데 걸리는
+# 시간"이었다. r² 통과 후 D 추정까지는 0.11초, D→H 확정은 0.00초다.
+#
+#   6초 → r²>=0.88 도달 : 3.43초   ← 여기가 전부
+#   r² 도달 → D 최초 추정 : 0.11초
+#   D 추정 → H 확정(락)   : 0.00초
+#
+# 그리고 그 실패는 비선형이 아니라 이상치 때문이었다 (50건 중 45건).
+#   늦은 시행 선형 r² 0.476 → 상위 10% 절삭 시 0.740 (+0.265)
+#                          → 2차 곡선 적합 시 0.508 (+0.033)
+#
+# 회귀 버퍼는 한 번 들어간 점이 빠지지 않으므로, 초반에 섞인 오염이 좋은 점이
+# 쌓일 때까지 r²를 눌러 놓는다. 입구 스파이크 게이트만으로는 못 막는다.
+# 입구는 직전 5개 중앙값(국소)만 보지만, 오염은 추세선(전역) 대비로만 드러난다.
+#   → r² 미달 시 잔차가 가장 큰 점을 하나씩 빼고 재적합한다. 한 주기 안에서
+#     끝나므로 기존처럼 1초를 통째로 버리지 않는다.
+#
+# 499회 재현 검증
+#   추정 성공      456/481 → 472/481 (+16건)
+#   늦던 시행(44건) 12.45초 → 10.51초
+#   정상 시행      9.38초 → 9.08초, 악화 0건
+#   D MAE 1.08cm 유지, 편향 +0.35 → +0.14, 컵내 변동계수 13.6% → 13.2%
+TRIM_RETRY_ENABLE   = True
+TRIM_RETRY_MAX_FRAC = 0.15   # 전체의 이 비율까지만 제거 (억지 적합 방지)
+
 JITTER_ENABLE       = True    # ②지터 안전 게이트 on/off
 JITTER_WIN_START    = 6.0     # 지터 측정 시작(초, 급수 기준)
 JITTER_WIN_END      = 8.0     # 지터 측정 종료 — 락(≈9.5초)보다 1.5초 앞섬
@@ -462,6 +488,10 @@ init_f_reject_reason    = ''         # 마지막 불합격 사유(진단용)
 
 # [v5.36-SHAPE] 실측 정합 지름 (표시/기록 전용 — 제어에는 쓰지 않는다)
 last_true_diameter_cm   = 0.0
+
+# [v5.38-TRIM-RETRY] 이상치 절삭 재시도 통계
+trim_retry_count        = 0          # 절삭으로 r²를 통과시킨 횟수
+trim_removed_total      = 0          # 누적 제거 점 수
 
 # [v5.37-TRANSIENT] 순간 튐/배음 배제 상태
 transient_blocked_count = 0          # 이번 시행에서 버린 샘플 수
@@ -798,6 +828,58 @@ def robust_slope_loess_lsm(times, inv_freqs):
         return None, 0.0, 0.0
 
 
+def _r2_threshold(slope: float) -> float:
+    """기울기 크기별 r² 임계값. 회귀 워커의 기존 판정과 동일하게 유지한다."""
+    a = abs(slope)
+    if a < 0.000035:
+        return 0.88
+    if a < 0.000055:
+        return 0.92
+    return 0.95
+
+
+def robust_slope_with_trim(times, inv_freqs):
+    """
+    [v5.38-TRIM-RETRY] r² 미달이면 잔차가 큰 점을 하나씩 빼고 재적합한다.
+
+    반환: (slope, intercept, r2, 제거한 점 수)
+      - 제거 수 0  : 절삭 없이 통과
+      - 제거 수 >0 : 그만큼 빼고 통과
+      - 제거 수 -1 : 상한까지 빼도 통과 못 함 (원래 결과 그대로 반환)
+
+    상한(TRIM_RETRY_MAX_FRAC)과 REG_MIN_POINTS 를 둬서, 점을 계속 빼며
+    억지로 r²를 맞추는 일이 없도록 한다. 통과 못 하면 기존처럼 다음 주기를
+    기다리는 게 맞다 — 나쁜 D 로 락되는 것보다 낫다.
+    """
+    slope, intercept, r2 = robust_slope_loess_lsm(times, inv_freqs)
+    if slope is not None and r2 > _r2_threshold(slope):
+        return slope, intercept, r2, 0
+    if not TRIM_RETRY_ENABLE:
+        return slope, intercept, r2, -1
+
+    x = np.asarray(times, dtype=float)
+    y = np.asarray(inv_freqs, dtype=float)
+    kept = np.ones(len(x), dtype=bool)
+    max_drop = int(len(x) * TRIM_RETRY_MAX_FRAC)
+
+    for k in range(1, max_drop + 1):
+        if kept.sum() <= REG_MIN_POINTS:                           # 표본이 모자라면 중단
+            break
+        try:
+            p = np.polyfit(x[kept], y[kept], 1)
+        except Exception:                                          # noqa: BLE001
+            break
+        res = np.abs(y - np.polyval(p, x))
+        res[~kept] = -1.0                                          # 이미 뺀 점은 후보에서 제외
+        kept[int(np.argmax(res))] = False
+
+        s2, b2, r22 = robust_slope_loess_lsm(x[kept], y[kept])
+        if s2 is not None and r22 > _r2_threshold(s2):
+            return s2, b2, r22, k
+
+    return slope, intercept, r2, -1
+
+
 def theory_freq(t: float) -> float:
     if not theory_locked:
         return 0.0
@@ -818,6 +900,7 @@ def _regression_worker():
     global last_d_locked_cm, last_d_candidate_median, last_d_candidate_mad
     global last_init_air_by_initfreq_cm, last_init_air_by_regression_cm, last_init_air_locked_cm
     global last_model_valid, last_reject_reason, last_control_profile
+    global trim_retry_count, trim_removed_total          # [v5.38-TRIM-RETRY]
 
     while True:
         _reg_event.wait(timeout=1.0)
@@ -841,7 +924,14 @@ def _regression_worker():
         if len(times) <= REG_MIN_POINTS:
             continue
 
-        s_a, s_b, r_sq = robust_slope_loess_lsm(times, inv_freqs)
+        s_a, s_b, r_sq, _trim_n = robust_slope_with_trim(times, inv_freqs)
+        if _trim_n > 0:
+            with lock:
+                trim_retry_count   += 1
+                trim_removed_total += _trim_n
+                _tr_n = int(trim_retry_count)
+            print(f'\n[절삭재시도] 이상치 {_trim_n}개 제거 후 r²={r_sq:.3f} 통과'
+                  f' (표본 {len(times)}개, 누적 {_tr_n}회)')
 
         if s_a is not None:
             if _cur_d > 0:
@@ -861,12 +951,7 @@ def _regression_worker():
         if s_a is None or abs(s_a) <= 1e-9:
             continue
 
-        if abs(s_a) < 0.000035:
-            r2_threshold = 0.88
-        elif abs(s_a) < 0.000055:
-            r2_threshold = 0.92
-        else:
-            r2_threshold = 0.95
+        r2_threshold = _r2_threshold(s_a)      # [v5.38] 절삭 재시도와 동일 판정 사용
 
         if r_sq <= r2_threshold:
             with lock:
@@ -1034,7 +1119,7 @@ def start_filling_local() -> None:
     global early_jitter_hz, jitter_alert, jitter_locked_in
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
     global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
-    global last_true_diameter_cm
+    global last_true_diameter_cm, trim_retry_count, trim_removed_total
     global transient_blocked_count, transient_holdoff, transient_last_reason, _transient_recent
 
     with lock:
@@ -1069,6 +1154,8 @@ def start_filling_local() -> None:
         init_f_best_candidate   = 0.0
         init_f_reject_reason    = ''
         last_true_diameter_cm   = 0.0   # [v5.36-SHAPE]
+        trim_retry_count        = 0     # [v5.38-TRIM-RETRY]
+        trim_removed_total      = 0
         transient_blocked_count = 0     # [v5.37-TRANSIENT]
         transient_holdoff       = 0
         transient_last_reason   = ''
@@ -1180,7 +1267,7 @@ def audio_callback(indata, frames, time_info, status):
     global early_jitter_hz, jitter_alert, jitter_locked_in
     global _jitter_prev_raw, _jitter_diffs, init_f_rejected, spike_up_blocked_count
     global init_f_retry_count, init_f_best_candidate, init_f_reject_reason
-    global last_true_diameter_cm
+    global last_true_diameter_cm, trim_retry_count, trim_removed_total
     global transient_blocked_count, transient_holdoff, transient_last_reason, _transient_recent
 
     if not is_filling:

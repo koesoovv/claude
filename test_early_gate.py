@@ -195,6 +195,60 @@ check('홀드오프가 있어 실제 상승을 영구 차단하지 않는다',
       core.TRANSIENT_HOLDOFF_N >= 2, f'{core.TRANSIENT_HOLDOFF_N}')
 check('TRANSIENT_ENABLE 스위치 존재', isinstance(core.TRANSIENT_ENABLE, bool))
 
+# ── 3-4. 이상치 절삭 재시도 [v5.38-TRIM-RETRY] ─────────────────
+print('\n[3-4] 회귀 실패 시 이상치 절삭 재시도')
+import numpy as _np
+check('절삭 재시도 함수 존재', hasattr(core, 'robust_slope_with_trim'))
+check('TRIM_RETRY_ENABLE 스위치 존재', isinstance(core.TRIM_RETRY_ENABLE, bool))
+check('제거 상한이 있다(억지 적합 방지)', 0 < core.TRIM_RETRY_MAX_FRAC <= 0.3,
+      f'{core.TRIM_RETRY_MAX_FRAC}')
+
+# r² 임계 판정이 워커와 일치하는지
+check('r² 임계: 완만한 기울기 0.88', abs(core._r2_threshold(-0.00002) - 0.88) < 1e-9)
+check('r² 임계: 중간 기울기 0.92', abs(core._r2_threshold(-0.00004) - 0.92) < 1e-9)
+check('r² 임계: 가파른 기울기 0.95', abs(core._r2_threshold(-0.00008) - 0.95) < 1e-9)
+
+# 깨끗한 직선 — 절삭 없이 통과해야 한다
+_t = _np.linspace(6.0, 20.0, 40)
+_slope = -2.5e-5
+_clean = 0.0012 + _slope * _t
+s1, b1, r1, k1 = core.robust_slope_with_trim(_t, _clean)
+check('깨끗한 직선은 절삭 없이 통과', s1 is not None and k1 == 0, f'제거 {k1}개')
+
+# 실기에서 실제로 락이 16.7초까지 밀렸던 Trial_0178 의 6~13초 구간이다.
+# 합성 데이터로는 기존 LOESS+75분위 절삭이 웬만한 오염을 이미 견디므로,
+# 실제로 실패했던 데이터를 그대로 쓴다.
+_T178_T = [6.031, 6.235, 6.437, 6.640, 6.841, 7.041, 7.242, 7.442, 7.644, 7.845,
+           8.045, 8.245, 8.445, 8.646, 8.846, 9.046, 9.246, 9.446, 9.646, 9.846,
+           10.046, 10.247, 10.447, 10.647, 10.850, 11.050, 11.250, 11.450,
+           11.651, 11.851, 12.052, 12.253, 12.454, 12.654, 12.854]
+_T178_F = [839.8, 829.0, 882.9, 1184.3, 872.1, 882.9, 2097.3, 904.4, 882.9, 1531.0,
+           1569.8, 1152.0, 960.4, 971.1, 952.8, 956.1, 967.9, 960.4, 971.1, 979.8,
+           966.8, 963.6, 981.9, 990.5, 1016.4, 990.5, 1022.8, 1025.0, 1043.3,
+           1048.7, 1093.9, 1070.2, 1076.7, 1098.2, 1096.0]
+_inv = [1.0 / v for v in _T178_F]
+
+_s0, _b0, _r0 = core.robust_slope_loess_lsm(_T178_T, _inv)
+check('실기 실패 데이터가 기존 방식으로는 r² 미달',
+      _s0 is not None and _r0 <= core._r2_threshold(_s0), f'r²={_r0:.3f}')
+s2, b2, r2, k2 = core.robust_slope_with_trim(_T178_T, _inv)
+check('절삭 재시도로 통과한다', s2 is not None and k2 > 0 and r2 > core._r2_threshold(s2),
+      f'제거 {k2}개 r²={r2:.3f}')
+check('절삭이 상한 이내', 0 < k2 <= int(len(_T178_T) * core.TRIM_RETRY_MAX_FRAC),
+      f'제거 {k2}개')
+check('절삭 후 기울기가 물리적으로 타당', s2 is not None and s2 < 0
+      and abs(s2) > core.MIN_SLOPE_CUTOFF, f'{s2:.3e}')
+
+# 상한을 넘는 오염은 억지로 통과시키지 않아야 한다
+_hopeless = _clean + _np.random.default_rng(0).normal(0, abs(_slope) * 25, len(_t))
+s4, b4, r4, k4 = core.robust_slope_with_trim(_t, _hopeless)
+check('가망 없는 데이터는 억지 통과시키지 않는다', k4 in (-1, 0), f'제거 {k4}개')
+
+# 표본이 모자라면 그대로 반환
+s3, b3, r3, k3 = core.robust_slope_with_trim(_t[:8], _clean[:8])
+check('표본 부족 시 죽지 않는다', k3 in (0, -1))
+check('절삭 통계 초기값', core.trim_retry_count == 0 and core.trim_removed_total == 0)
+
 # ── 4. 지터 설정 ────────────────────────────────────────────────
 print('\n[4] 지터 측정 설정')
 check('측정 창이 락 시각(≈9.5초)보다 먼저 끝난다', core.JITTER_WIN_END <= 9.0,
